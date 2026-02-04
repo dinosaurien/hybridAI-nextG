@@ -219,6 +219,7 @@ class EnhancedReasonerAgent:
         self.bus = bus
         self.knowledge_base = knowledge_base
         self.use_llm = use_llm  # Not used, kept for compatibility
+        self.re_reason_timer = 0 
         
         self.current_intent: Optional[Dict[str, Any]] = None
         self.active_intent_id: Optional[str] = None
@@ -259,6 +260,16 @@ class EnhancedReasonerAgent:
             self.baseline_learner.add_observation(metric, value)
             
             # --- State Machine Logic ---
+
+            if self.state == IntentState.ASSURANCE:
+                if not self.slo_config.meets_slo(metric, value):
+                    self.re_reason_timer += 1
+                    if self.re_reason_timer >= 10: # Re-reason every 10 deviations (approx 10 seconds)
+                        logger.info(f"[STATE] Still violating SLO. Re-triggering LLM Reasoner...")
+                        self.state = IntentState.ACTIVATING 
+                        self.re_reason_timer = 0
+                else:
+                    self.re_reason_timer = 0 # Reset if SLO is met
             
             # 1. MONITORING State
             if self.state == IntentState.MONITORING:
@@ -347,15 +358,40 @@ class EnhancedReasonerAgent:
     async def _create_intent_from_slo(self, metric: str, value: float, slo: Dict[str, Any], scope: Dict[str, Any] = None):
         """Create and publish intent to meet SLO target."""
         try:
-            # Determine intent type
-            if slo["direction"] == "lower_better":
-                intent_type = "REDUCE_LATENCY"
-            elif slo["direction"] == "higher_better":
-                intent_type = "INCREASE_THROUGHPUT"
+            # --- START BIASED LLM INJECTION ---
+            if self.use_llm:
+                print(f"\n[GPT-2] Detected SLO Violation: {metric}={value:.2f}. Triggering Biased GPT-2...")
+                try:
+                    import sys
+                    import os
+                    # Ensure the path where llm_logic.py lives is in Python's search list
+                    llm_dir = "/home/exposed/Desktop/hybridAI-nextG/src/demo/ain/RL_demo"
+                    if llm_dir not in sys.path:
+                        sys.path.append(llm_dir)
+                    
+                    from llm_logic import generate_biased_gpt2_intent
+                    
+                    # Call your biased GPT-2 logic
+                    llm_result = generate_biased_gpt2_intent({"metric": metric, "target": slo["target"], "scope": scope})
+                    
+                    intent_type = llm_result["intent"]
+                    suggestion = llm_result["slo"]["suggestion"]
+                    print(f"[GPT-2] LLM Suggestion: {suggestion} -> Intent: {intent_type}\n")
+                except Exception as e:
+                    logger.error(f"[GPT-2] LLM Failed: {e}. Falling back to default.")
+                    intent_type = "REDUCE_LATENCY" if slo["direction"] == "lower_better" else "INCREASE_THROUGHPUT"
+                    suggestion = "Default Fallback"
             else:
-                intent_type = "OPTIMIZE_UTILIZATION"
-            
-            # Use SLO target (static, operator-defined)
+                # Default non-LLM logic
+                if slo["direction"] == "lower_better":
+                    intent_type = "REDUCE_LATENCY"
+                elif slo["direction"] == "higher_better":
+                    intent_type = "INCREASE_THROUGHPUT"
+                else:
+                    intent_type = "OPTIMIZE_UTILIZATION"
+                suggestion = "Rule-based"
+            # --- END BIASED LLM INJECTION ---
+
             target = slo["target"]
             
             # Create RL Intent
@@ -377,6 +413,7 @@ class EnhancedReasonerAgent:
                 "type": rl_intent.type,
                 "slo_id": slo.get("slo_id"),
                 "scope": scope or {},
+                "llm_suggestion": suggestion # For tracking
             }
             self.active_intent_id = self.current_intent["intent_id"]
             
@@ -398,11 +435,8 @@ class EnhancedReasonerAgent:
                 }
             ))
             
-            baseline = self.baseline_learner.get_baseline(metric)
             if should_log(LOG_INTENT):
-                baseline_info = f"baseline_p50={baseline['p50']:.2f}" if baseline else "baseline_learning"
-                logger.info(f"[INTENT] Created intent: {rl_intent.type} for {rl_intent.metric} "
-                          f"(SLO_target={target:.2f}, current={value:.2f}, {baseline_info})")
+                logger.info(f"[INTENT] Suggested Action: {intent_type} (LLM: {suggestion})")
             
         except Exception as e:
             logger.error(f"[INTENT] Error creating intent from SLO: {e}", exc_info=True)

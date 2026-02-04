@@ -1,9 +1,23 @@
 from __future__ import annotations
 import uuid
+import sys
+import os
 from typing import Any, Dict
 
-from ain.brain.openai_client import reason_from_deviation, OpenAIError, fallback_intent_for_deviation
+from ain.brain.openai_client import fallback_intent_for_deviation
 
+try:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    llm_dir = os.path.join(current_dir, "..", "RL_demo")
+    
+    if os.path.exists(llm_dir) and llm_dir not in sys.path:
+        sys.path.insert(0, llm_dir)
+        
+    from ain.RL_demo.llm_logic import generate_biased_gpt2_intent
+    HAS_LLM = True
+except ImportError:
+    print("[GPT-2] Warning: llm_logic.py not found. LLM disabled.")
+    HAS_LLM = False
 
 def normalize_deviation(event: Dict[str, Any]) -> Dict[str, Any]:
     dev = {
@@ -28,33 +42,65 @@ def normalize_deviation(event: Dict[str, Any]) -> Dict[str, Any]:
         dev["target"] = float(slo["target"])
     if dev["target"] is None:
         dev["target"] = dev["value"] * (0.8 if dev["direction"] == "lower_better" else 1.2)
-    if not dev.get("evidence_ref"):
-        dev["evidence_ref"] = "telemetry://window/A"
     return dev
 
-
-def to_proposer_meta(net_intent: Dict[str, Any]) -> Dict[str, Any]:
-    slo = net_intent.get("slo", {})
-    metric = "delay_p95_ms" if "latency_ms" in slo else "thr_dl_bps"
-    intent_tag = "LATENCY_P95" if metric == "delay_p95_ms" else "THR_DL"
-    scope = net_intent.get("scope", {})
-    if scope.get("cell_id"):
-        scope_str = f"CELL:{scope['cell_id']}"
-    elif scope.get("region"):
-        scope_str = f"REGION:{scope['region']}"
-    else:
-        scope_str = "GLOBAL"
-    return {"intent": intent_tag, "scope": scope_str}
-
-
 def to_rl_intent(net_intent: Dict[str, Any]) -> Dict[str, Any]:
-    slo = net_intent.get("slo", {})
-    if "latency_ms" in slo:
-        return {"type": "REDUCE_LATENCY", "metric": "delay_p95_ms", "target": float(slo["latency_ms"]), "direction": "lower_better", "action_cost": 0.01, "reward_clip": 20.0}
-    else:
-        tgt = float(slo.get("thr_dl_bps", 50e6))
-        return {"type": "INCREASE_THROUGHPUT", "metric": "thr_dl_bps", "target": tgt, "direction": "higher_better", "action_cost": 0.01, "reward_clip": 20.0}
+    """
+    Maps the LLM's high-level intent to the specific configuration 
+    the RL Agent (DQN) requires to select a playbook.
+    """
+    # Get the raw intent string from the LLM (e.g., "OPTIMIZE_UTILIZATION")
+    intent_str = str(net_intent.get("intent", "")).upper()
+    
+    # Get the metric and target from the deviation data passed through
+    slo_data = net_intent.get("slo", {})
+    metric = slo_data.get("metric", "DRB_PdcpSduDelayDl")
+    target = float(slo_data.get("target", 25.0))
 
+    #Mapping logic
+    if "THROUGHPUT" in intent_str:
+        return {
+            "type": "INCREASE_THROUGHPUT", 
+            "metric": "thr_dl_bps", # Use standard internal metric name
+            "target": target if target > 1000 else 50e6,
+            "direction": "higher_better", 
+            "action_cost": 0.01, 
+            "reward_clip": 20.0
+        }
+        
+    elif "UTILIZATION" in intent_str:
+        # LLM suggested BACKHAUL_LIMIT -> OPTIMIZE_UTILIZATION
+        return {
+            "type": "OPTIMIZE_UTILIZATION",
+            "metric": "RRU_PrbUsedDl", # Target PRB usage
+            "target": 80.0, # Target 80% utilization max
+            "direction": "lower_better",
+            "action_cost": 0.01,
+            "reward_clip": 20.0
+        }
+        
+    elif "RELIABILITY" in intent_str:
+        # LLM suggested TX_POWER -> INCREASE_RELIABILITY
+        return {
+            "type": "INCREASE_RELIABILITY",
+            "metric": "bler_dl", # Target Block Error Rate
+            "target": 0.05, # Target 5% error rate max
+            "direction": "lower_better",
+            "action_cost": 0.01,
+            "reward_clip": 20.0
+        }
+        
+    else:
+        # Default / Fallback: REDUCE_LATENCY
+        # Handles "BUFFER_SIZE" and generic fallback
+        return {
+            "type": "REDUCE_LATENCY", 
+            "metric": metric, 
+            "target": target, 
+            "direction": "lower_better", 
+            "action_cost": 0.01, 
+            "reward_clip": 20.0
+        }
 
 def create_network_intent_from_deviation(dev: Dict[str, Any], use_llm: bool = True) -> Dict[str, Any]:
     dev_norm = normalize_deviation(dev)

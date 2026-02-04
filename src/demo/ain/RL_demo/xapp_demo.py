@@ -32,7 +32,12 @@ from ain.loop.predictor import SlateDQNPredictor
 from ain.loop.proposer import ActionSpace, ProposerSampler, CacheLibrary, PLAYBOOK_K, CANDIDATE_N, COOLDOWN_STEPS, cooldown_key
 from ain.loop.actor import Actor
 from ain.brain.llm_reasoner import normalize_deviation, to_proposer_meta, to_rl_intent
-from ain.brain.openai_client import reason_from_deviation, OpenAIError, fallback_intent_for_deviation
+from ain.brain.openai_client import fallback_intent_for_deviation
+try:
+    from llm_logic import generate_biased_gpt2_intent
+    HAS_LOCAL_LLM = True
+except ImportError:
+    HAS_LOCAL_LLM = False
 from ain.common.types import ControlAction, Playbook
 
 import logging
@@ -1041,12 +1046,21 @@ async def run_ai_loop(
             logger.info(f"   Severity: {dev_raw['severity']}")
             logger.info(f"═══════════════════════════════════════════════════════════")
             
-            dev = normalize_deviation(dev_raw)
-            try:
-                net_intent = reason_from_deviation(dev)
-            except OpenAIError:
+                        
+            # --- START LOCAL BIASED LLM LOGIC ---
+            if use_llm:
+                try:
+                    logger.info("Calling Local Biased GPT-2 on AMD GPU...")
+                    # This calls the logic from your llm_logic.py
+                    from llm_logic import generate_biased_gpt2_intent
+                    net_intent = generate_biased_gpt2_intent(dev)
+                except Exception as e:
+                    logger.error(f"Local LLM Error: {e}. Falling back to hardcoded logic.")
+                    net_intent = fallback_intent_for_deviation(dev)
+            else:
                 net_intent = fallback_intent_for_deviation(dev)
-            
+            # --- END LOCAL BIASED LLM LOGIC ---
+
             intent_meta = to_proposer_meta(net_intent)
             rl_cfg = to_rl_intent(net_intent)
             
@@ -1142,6 +1156,7 @@ async def main():
                        help="Enable sending control commands to xApp (default: enabled)")
     parser.add_argument("--commands-disabled", action="store_false", dest="commands_enabled",
                        help="Disable sending control commands to xApp (useful for KPI collection only)")
+    parser.add_argument("--use-llm", action="store_true", help="Use local biased GPT-2 for reasoning")
     
     args = parser.parse_args()
     
@@ -1166,6 +1181,7 @@ async def main():
             steps=args.steps,
             offline_model=args.offline_model,
             default_node_id=args.default_node_id,
+            use_llm=args.use_llm,
         )
     except KeyboardInterrupt:
         logger.info("Interrupted by user")

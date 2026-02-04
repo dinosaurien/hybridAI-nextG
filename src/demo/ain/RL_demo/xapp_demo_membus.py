@@ -55,6 +55,17 @@ from ain.common.log_config import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- START ROCm LLM INJECTION ---
+try:
+    from llm_logic import generate_biased_gpt2_intent
+    import ain.agents.reasoner_agent_enhanced as rae
+    
+    # Overwrite the default reasoning function with our local biased GPT-2
+    rae.create_network_intent_from_deviation = generate_biased_gpt2_intent
+    
+except Exception as e:
+    logger.error(f"[GPT-2] Failed to inject LLM: {e}")
+# --- END ROCm LLM INJECTION ---
 
 class XAppKPIAdapter:
     """Converts xApp KPI format to internal format expected by RLObserver."""
@@ -1822,15 +1833,23 @@ async def main():
     
     args = parser.parse_args()
     
-    # Configure log levels
-    log_levels = parse_log_levels(args.log_level)
-    set_log_levels(log_levels)
-    enabled_names = [CATEGORY_NAMES.get(l, str(l)) for l in sorted(log_levels)]
-    logger.info(f"==========================================")
-    logger.info(f"Log Level Configuration:")
-    logger.info(f"  Enabled categories: {', '.join(enabled_names)}")
-    logger.info(f"  Total: {len(log_levels)}/{7} categories")
-    logger.info(f"==========================================")
+    if args.use_llm:
+        logger.info("[GPT-2]: INITIALIZING BIASED GPT-2 ON AMD GPU...")
+        try:
+            # Force path so it finds llm_logic.py in the same folder
+            import os
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            
+            from llm_logic import generate_biased_gpt2_intent
+            import ain.agents.reasoner_agent_enhanced as rae
+            
+            # Patch the function
+            rae.create_network_intent_from_deviation = generate_biased_gpt2_intent
+            
+            logger.info("SUCCESS: Reasoner Agent patched with local Biased GPT-2")
+        except Exception as e:
+            logger.error(f"CRITICAL: LLM Injection Failed: {e}")
+        print("="*60 + "\n")
     
     # Create TCP server
     tcp_server = XAppTCPServer(host=args.host, port=args.port, commands_enabled=args.commands_enabled)
