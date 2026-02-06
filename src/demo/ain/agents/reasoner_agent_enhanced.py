@@ -16,7 +16,6 @@ import numpy as np
 from collections import deque
 from datetime import datetime, timezone
 from .utils import make_msg
-from ain.loop.observer_rl import Intent
 from ain.common.log_config import should_log, LOG_INTENT
 
 logger = logging.getLogger(__name__)

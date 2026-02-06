@@ -43,11 +43,6 @@ fi
 ARGS=(
     "--host" "$HOST"
     "--port" "$PORT"
-    "--target-metric" "$TARGET_METRIC"
-    "--target-value" "$TARGET_VALUE"
-    "--cells" $CELLS
-    "--slices" $SLICES
-    "--steps" "$STEPS"
     "--log-level" "$LOG_LEVEL"
 )
 
@@ -75,18 +70,6 @@ if [ "$COMMANDS_DISABLED" = "true" ]; then
     ARGS+=("--commands-disabled")
 fi
 
-# Add model type for loss history filename
-MODEL_TYPE="${MODEL_TYPE:-stable}"
-ARGS+=("--model-type" "$MODEL_TYPE")
-
-# Add loss history file if specified
-if [ -n "$LOSS_HISTORY_FILE" ]; then
-    ARGS+=("--loss-history-file" "$LOSS_HISTORY_FILE")
-fi
-
-# Add SLO file if specified
-SLO_FILE="${SLO_FILE:-configs/slos.json}"
-ARGS+=("--slo-file" "$SLO_FILE")
 
 echo "=========================================="
 echo "Starting AI System on AMD GPU (ROCm 6.1.2)"
