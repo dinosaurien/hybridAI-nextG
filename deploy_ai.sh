@@ -18,9 +18,6 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-6000}"
 TARGET_METRIC="${TARGET_METRIC:-DRB_PdcpSduDelayDl}"
 TARGET_VALUE="${TARGET_VALUE:-30.0}"
-CELLS="${CELLS:-CELL_001}"
-SLICES="${SLICES:-SLICE_A}"
-STEPS="${STEPS:-1000}"
 LOG_LEVEL="${LOG_LEVEL:-8,2,9}"
 
 # Loss plotting options
@@ -29,10 +26,6 @@ PLOT_LOSS="${PLOT_LOSS:-false}"
 STABLE_LOSS_FILE="${STABLE_LOSS_FILE:-models/loss_history_stable.json}"
 UNSTABLE_LOSS_FILE="${UNSTABLE_LOSS_FILE:-models/loss_history_unstable.json}"
 LOSS_PLOT_OUTPUT="${LOSS_PLOT_OUTPUT:-loss_plot.png}"
-
-# --- LLM SETTINGS ---
-# Set USE_LLM to true by default sinced im using a gpt-2 biased model
-USE_LLM="${USE_LLM:-true}"
 
 # Check if poetry is installed
 if ! command -v poetry &> /dev/null; then
@@ -44,11 +37,6 @@ ARGS=(
     "--host" "$HOST"
     "--port" "$PORT"
     "--target-metric" "$TARGET_METRIC"
-    "--target-value" "$TARGET_VALUE"
-    "--cells" $CELLS
-    "--slices" $SLICES
-    "--steps" "$STEPS"
-    "--log-level" "$LOG_LEVEL"
 )
 
 # Add optional MiniRocket models if they exist
@@ -75,18 +63,10 @@ if [ "$COMMANDS_DISABLED" = "true" ]; then
     ARGS+=("--commands-disabled")
 fi
 
-# Add model type for loss history filename
-MODEL_TYPE="${MODEL_TYPE:-stable}"
-ARGS+=("--model-type" "$MODEL_TYPE")
-
 # Add loss history file if specified
 if [ -n "$LOSS_HISTORY_FILE" ]; then
     ARGS+=("--loss-history-file" "$LOSS_HISTORY_FILE")
 fi
-
-# Add SLO file if specified
-SLO_FILE="${SLO_FILE:-configs/slos.json}"
-ARGS+=("--slo-file" "$SLO_FILE")
 
 echo "=========================================="
 echo "Starting AI System on AMD GPU (ROCm 6.1.2)"
