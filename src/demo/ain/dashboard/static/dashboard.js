@@ -1,4 +1,51 @@
-// AI Dashboard WebSocket Client
+/**
+ * AI Network Optimizer - Dashboard Logic
+ * Handles WebSocket communication and REST API calls for intents.
+ */
+
+// --- API Functionality ---
+
+async function sendIntent() {
+    const input = document.getElementById('userIntent');
+    const text = input.value.trim();
+    
+    if (!text) return;
+
+    // Visual feedback
+    const btn = document.getElementById('sendIntentBtn');
+    const originalText = btn.innerText;
+    btn.innerText = "Sending...";
+    btn.disabled = true;
+
+    try {
+        const response = await fetch('/api/intent', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ text: text })
+        });
+
+        const data = await response.json();
+        console.log("Intent Sent:", data);
+        
+        if (data.status === "ok") {
+            input.value = ""; // Clear input on success
+        } else {
+            alert("Error: " + (data.msg || "Unknown error"));
+        }
+
+    } catch (error) {
+        console.error("Error sending intent:", error);
+        alert("Failed to send intent. Is the backend running?");
+    } finally {
+        btn.innerText = originalText;
+        btn.disabled = false;
+    }
+}
+
+
+// --- WebSocket Client ---
 
 class DashboardClient {
     constructor() {
@@ -7,13 +54,13 @@ class DashboardClient {
         this.maxReconnectAttempts = 10;
         this.reconnectAttempts = 0;
 
-        // State
+        // Data State
         this.intents = new Map();
         this.deviations = [];
         this.commands = [];
         this.maxHistoryItems = 50;
 
-        // UI Elements
+        // UI References
         this.statusDot = document.getElementById('statusDot');
         this.statusText = document.getElementById('statusText');
         this.intentsList = document.getElementById('intentsList');
@@ -22,21 +69,23 @@ class DashboardClient {
         this.intentCount = document.getElementById('intentCount');
         this.deviationCount = document.getElementById('deviationCount');
         this.commandCount = document.getElementById('commandCount');
-
-        // Metrics
         this.gnbLatency = document.getElementById('gnbLatency');
         this.cellId = document.getElementById('cellId');
         this.ueCountBadge = document.getElementById('ueCountBadge');
         this.ueMetricsList = document.getElementById('ueMetricsList');
+        this.gnbState = { latency: "--", cellId: "--" };
+        this.ueState = new Map(); // Key: ueId, Value: ueData
 
         this.connect();
     }
 
     connect() {
+        // Automatically determine WS protocol and host based on current page
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.hostname}:8081`;
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
 
         try {
+            console.log(`Connecting to WebSocket at ${wsUrl}...`);
             this.ws = new WebSocket(wsUrl);
 
             this.ws.onopen = () => this.onConnect();
@@ -44,7 +93,7 @@ class DashboardClient {
             this.ws.onclose = () => this.onDisconnect();
             this.ws.onerror = (error) => this.onError(error);
         } catch (error) {
-            console.error('WebSocket connection error:', error);
+            console.error('WebSocket connection setup error:', error);
             this.scheduleReconnect();
         }
     }
@@ -71,7 +120,7 @@ class DashboardClient {
 
             switch (message.type) {
                 case 'connected':
-                    console.log('Dashboard connected:', message.message);
+                    console.log('Backend Handshake:', message.message);
                     break;
                 case 'intent':
                     this.handleIntent(message.data);
@@ -86,7 +135,7 @@ class DashboardClient {
                     this.handleKPI(message.data);
                     break;
                 default:
-                    console.log('Unknown message type:', message.type);
+                    console.warn('Unknown message type:', message.type);
             }
         } catch (error) {
             console.error('Error parsing message:', error);
@@ -111,9 +160,11 @@ class DashboardClient {
         }
     }
 
-    handleIntent(data) {
+    // --- Handlers ---
+
+handleIntent(data) {
+        // This receives the message from DashboardServer
         if (!data || Object.keys(data).length === 0) {
-            // Empty intent = clear all
             this.intents.clear();
         } else {
             const intentId = data.intent_id || 'unknown';
@@ -122,13 +173,48 @@ class DashboardClient {
         this.renderIntents();
     }
 
+    renderIntents() {
+        this.intentCount.textContent = this.intents.size;
+
+        if (this.intents.size === 0) {
+            this.intentsList.innerHTML = '<div class="empty-state">No active intents</div>';
+            return;
+        }
+
+        const html = Array.from(this.intents.values()).map(intent => {
+            // 1. Format Triggering Intents (The black code box)
+            const triggers = (intent.triggering_intents && intent.triggering_intents.length > 0)
+                ? `<pre class="trigger-code"><code>${intent.triggering_intents.join('\n')}</code></pre>`
+                : `<p class="no-data">Monitoring network...</p>`;
+
+            // 2. Format Procedure (The numbered list)
+            const procedure = (intent.procedure && intent.procedure.length > 0)
+                ? `<ol class="procedure-steps">${intent.procedure.map(step => `<li>${this.escapeHtml(step)}</li>`).join('')}</ol>`
+                : `<p class="no-data">Decomposing requirements...</p>`;
+
+            return `
+                <div class="intent-card hierarchical">
+                    <div class="intent-type">${this.escapeHtml(intent.type || 'INTENT ACTIVE')}</div>
+                    
+                    <div class="intent-label-small">Triggering Intents</div>
+                    <div class="intent-triggers-container">${triggers}</div>
+                    
+                    <div class="intent-label-small">Resulting Procedure</div>
+                    <div class="intent-procedure-container">${procedure}</div>
+                    
+                    <div class="intent-scope">Scope: ${this.formatScope ? this.formatScope(intent.scope) : (intent.scope || 'Global')}</div>
+                </div>
+            `;
+        }).join('');
+
+        this.intentsList.innerHTML = html;
+    }
     handleDeviation(data) {
         this.deviations.unshift({
             ...data,
             timestamp: new Date().toISOString()
         });
 
-        // Keep only recent items
         if (this.deviations.length > this.maxHistoryItems) {
             this.deviations = this.deviations.slice(0, this.maxHistoryItems);
         }
@@ -142,7 +228,6 @@ class DashboardClient {
             timestamp: new Date().toISOString()
         });
 
-        // Keep only recent items
         if (this.commands.length > this.maxHistoryItems) {
             this.commands = this.commands.slice(0, this.maxHistoryItems);
         }
@@ -153,12 +238,10 @@ class DashboardClient {
     handleKPI(data) {
         const { cell, ues } = data;
 
-        // Update gNB latency
+        // Update gNB metrics
         if (cell && cell.DRB_PdcpSduDelayDl !== undefined) {
             this.gnbLatency.textContent = cell.DRB_PdcpSduDelayDl.toFixed(2);
         }
-
-        // Update cell ID
         if (cell && cell.cell_id) {
             this.cellId.textContent = cell.cell_id;
         }
@@ -173,12 +256,13 @@ class DashboardClient {
         }
     }
 
+    // --- Rendering ---
+
     renderUEMetrics(ues) {
         const html = ues.map(ue => {
             const ueId = ue.ue_id || 'Unknown';
             const latency = ue.UE_DRB_PdcpSduDelayDl_UEID;
             const throughput = ue.UE_DRB_UEThpDl_UEID;
-            const bler = ue.UE_DRB_BlerDl_UEID;
 
             return `
                 <div class="ue-card">
@@ -195,37 +279,11 @@ class DashboardClient {
                             <span class="value">${(throughput / 1e6).toFixed(2)} Mbps</span>
                         </div>
                     ` : ''}
-                    ${bler !== undefined ? `
-                        <div class="ue-metric-row">
-                            <span class="label">BLER:</span>
-                            <span class="value">${(bler * 100).toFixed(2)}%</span>
-                        </div>
-                    ` : ''}
                 </div>
             `;
         }).join('');
 
         this.ueMetricsList.innerHTML = html;
-    }
-
-    renderIntents() {
-        this.intentCount.textContent = this.intents.size;
-
-        if (this.intents.size === 0) {
-            this.intentsList.innerHTML = '<div class="empty-state">No active intents</div>';
-            return;
-        }
-
-        const html = Array.from(this.intents.values()).map(intent => `
-            <div class="intent-card">
-                <div class="intent-type">${this.escapeHtml(intent.type || 'UNKNOWN')}</div>
-                <div class="intent-metric">Metric: ${this.escapeHtml(intent.metric || 'N/A')}</div>
-                <div class="intent-metric">Target: ${intent.target !== undefined ? intent.target.toFixed(2) : 'N/A'} (${this.escapeHtml(intent.direction || 'N/A')})</div>
-                <div class="intent-scope">Scope: ${this.formatScope(intent.scope)}</div>
-            </div>
-        `).join('');
-
-        this.intentsList.innerHTML = html;
     }
 
     renderDeviations() {
@@ -239,8 +297,7 @@ class DashboardClient {
         const html = this.deviations.slice(0, 20).map(dev => `
             <div class="deviation-item">
                 <div class="deviation-metric">${this.escapeHtml(dev.metric || 'Unknown')}</div>
-                <div class="deviation-value">Value: ${dev.value !== undefined ? dev.value.toFixed(2) : 'N/A'} | Severity: ${this.escapeHtml(dev.severity || 'N/A')}</div>
-                <div class="deviation-value">Scope: ${this.formatScope(dev.scope)}</div>
+                <div class="deviation-value">Val: ${dev.value !== undefined ? dev.value.toFixed(2) : 'N/A'}</div>
                 <div class="deviation-time">${this.formatTime(dev.timestamp)}</div>
             </div>
         `).join('');
@@ -267,13 +324,7 @@ class DashboardClient {
         this.commandsList.innerHTML = html;
     }
 
-    formatScope(scope) {
-        if (!scope) return 'N/A';
-        const parts = [];
-        if (scope.ue_id) parts.push(`UE: ${scope.ue_id}`);
-        if (scope.cell_id) parts.push(`Cell: ${scope.cell_id}`);
-        return parts.length > 0 ? parts.join(', ') : 'Global';
-    }
+    // --- Helpers ---
 
     formatParams(params) {
         if (!params) return 'N/A';
@@ -293,7 +344,23 @@ class DashboardClient {
     }
 }
 
-// Initialize dashboard when page loads
+// --- Initialization ---
+
 document.addEventListener('DOMContentLoaded', () => {
+    // 1. Initialize WebSocket Client
     new DashboardClient();
+
+    // 2. Attach Event Listener to Button
+    const btn = document.getElementById('sendIntentBtn');
+    if(btn) {
+        btn.addEventListener('click', sendIntent);
+    }
+
+    // 3. Allow "Enter" key in input field
+    const input = document.getElementById('userIntent');
+    if(input) {
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendIntent();
+        });
+    }
 });

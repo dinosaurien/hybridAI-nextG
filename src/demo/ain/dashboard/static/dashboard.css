@@ -1,3 +1,4 @@
+/* --- Global & Theme Variables --- */
 * {
     margin: 0;
     padding: 0;
@@ -24,7 +25,6 @@ body {
     background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
     color: var(--text-primary);
     min-height: 100vh;
-    overflow-x: hidden;
 }
 
 .container {
@@ -33,7 +33,8 @@ body {
     padding: 20px;
 }
 
-/* Header */
+/* --- Components --- */
+
 .header {
     background: var(--bg-panel);
     backdrop-filter: blur(10px);
@@ -44,19 +45,11 @@ body {
     box-shadow: var(--shadow);
 }
 
-.header-content {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-}
-
 .header h1 {
     font-size: 28px;
-    font-weight: 700;
     background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
-    background-clip: text;
 }
 
 .connection-status {
@@ -72,26 +65,14 @@ body {
     height: 10px;
     border-radius: 50%;
     background: var(--error);
-    animation: pulse 2s infinite;
 }
 
 .status-dot.connected {
     background: var(--success);
+    box-shadow: 0 0 10px var(--success);
 }
 
-@keyframes pulse {
-
-    0%,
-    100% {
-        opacity: 1;
-    }
-
-    50% {
-        opacity: 0.5;
-    }
-}
-
-/* Dashboard Grid */
+/* --- Layout Grid --- */
 .dashboard-grid {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
@@ -100,275 +81,275 @@ body {
 
 .panel {
     background: var(--bg-panel);
-    backdrop-filter: blur(10px);
     border: 1px solid var(--border-color);
     border-radius: 16px;
     padding: 24px;
     box-shadow: var(--shadow);
-    transition: transform 0.2s, box-shadow 0.2s;
-}
-
-.panel:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
 }
 
 .panel-header {
     display: flex;
     justify-content: space-between;
-    align-items: center;
     margin-bottom: 20px;
     padding-bottom: 16px;
     border-bottom: 1px solid var(--border-color);
 }
 
-.panel-header h2 {
-    font-size: 18px;
-    font-weight: 600;
-}
-
 .badge {
     background: var(--accent-primary);
-    color: white;
     padding: 4px 12px;
     border-radius: 12px;
     font-size: 12px;
     font-weight: 600;
 }
 
-.panel-content {
-    min-height: 200px;
-}
-
 .scrollable {
-    max-height: 400px;
+    max-height: 450px;
     overflow-y: auto;
+    padding-right: 8px;
 }
 
-.scrollable::-webkit-scrollbar {
-    width: 6px;
-}
-
-.scrollable::-webkit-scrollbar-track {
-    background: rgba(255, 255, 255, 0.05);
-    border-radius: 3px;
-}
-
-.scrollable::-webkit-scrollbar-thumb {
-    background: var(--accent-primary);
-    border-radius: 3px;
-}
-
-.empty-state {
-    text-align: center;
-    color: var(--text-secondary);
-    padding: 60px 20px;
-    font-size: 14px;
-}
-
-/* Intent Cards */
+/* --- Intent Cards (Hierarchical Logic) --- */
 .intent-card {
-    background: rgba(99, 102, 241, 0.1);
+    background: rgba(99, 102, 241, 0.05);
     border: 1px solid var(--accent-primary);
+    border-left: 4px solid var(--accent-primary);
     border-radius: 12px;
     padding: 16px;
-    margin-bottom: 12px;
+    margin-bottom: 16px;
     animation: slideIn 0.3s ease-out;
 }
 
-@keyframes slideIn {
-    from {
-        opacity: 0;
-        transform: translateX(-20px);
-    }
-
-    to {
-        opacity: 1;
-        transform: translateX(0);
-    }
-}
-
-.intent-card .intent-type {
-    font-size: 14px;
-    font-weight: 600;
+.intent-type {
+    font-size: 15px;
+    font-weight: 700;
     color: var(--accent-primary);
-    margin-bottom: 8px;
+    text-transform: uppercase;
 }
 
-.intent-card .intent-metric {
-    font-size: 12px;
+.intent-label-small {
+    font-size: 0.65rem;
+    font-weight: 800;
     color: var(--text-secondary);
+    margin-top: 14px;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.intent-reasoning-container {
+    font-size: 0.85rem;
+    color: #cbd5e1;
+    line-height: 1.5;
+}
+
+.intent-reasoning-container ul {
+    padding-left: 18px;
+}
+
+.intent-reasoning-container li {
     margin-bottom: 4px;
 }
 
-.intent-card .intent-scope {
-    font-size: 11px;
-    color: var(--text-secondary);
-    font-family: 'Courier New', monospace;
+.decomp-list {
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 6px;
+    padding: 10px;
 }
 
-/* Deviation Items */
+.decomp-row {
+    font-size: 0.8rem;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    color: var(--text-primary);
+}
+
+.decomp-row:last-child { border-bottom: none; }
+
+.decomp-row b {
+    color: var(--success);
+    font-family: monospace;
+}
+
+.intent-scope {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    margin-top: 12px;
+    font-family: monospace;
+    text-align: right;
+}
+
+/* --- Minirocket & Actuator Items --- */
+.deviation-item, .command-item {
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 10px;
+    font-size: 13px;
+}
+
 .deviation-item {
     background: rgba(239, 68, 68, 0.1);
     border-left: 3px solid var(--error);
-    border-radius: 8px;
-    padding: 12px;
-    margin-bottom: 10px;
-    animation: slideIn 0.3s ease-out;
 }
 
-.deviation-item .deviation-metric {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--error);
-    margin-bottom: 6px;
-}
-
-.deviation-item .deviation-value {
-    font-size: 12px;
-    color: var(--text-secondary);
-}
-
-.deviation-item .deviation-time {
-    font-size: 11px;
-    color: var(--text-secondary);
-    margin-top: 4px;
-}
-
-/* Command Items */
 .command-item {
     background: rgba(16, 185, 129, 0.1);
     border-left: 3px solid var(--success);
-    border-radius: 8px;
-    padding: 12px;
-    margin-bottom: 10px;
-    animation: slideIn 0.3s ease-out;
 }
 
-.command-item .command-name {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--success);
-    margin-bottom: 6px;
-}
+.deviation-metric { font-weight: 600; color: var(--error); }
+.command-name { font-weight: 600; color: var(--success); }
 
-.command-item .command-params {
+.command-params {
+    font-family: monospace;
     font-size: 11px;
+    display: block;
+    margin-top: 5px;
+    word-break: break-all;
     color: var(--text-secondary);
-    font-family: 'Courier New', monospace;
 }
 
-.command-item .command-time {
-    font-size: 11px;
-    color: var(--text-secondary);
-    margin-top: 4px;
-}
-
-/* gNB Metric Card */
+/* --- KPI Metrics Section --- */
 .gnb-metric-card {
     background: rgba(99, 102, 241, 0.1);
     border: 1px solid var(--accent-primary);
     border-radius: 12px;
-    padding: 16px;
+    padding: 20px;
     margin-bottom: 20px;
 }
 
 .metric-header {
-    font-size: 14px;
-    font-weight: 600;
+    font-size: 12px;
+    font-weight: 800;
     color: var(--accent-primary);
     margin-bottom: 12px;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
 }
 
-.metric-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 8px;
-}
-
-.metric-row .metric-label {
-    font-size: 12px;
-    color: var(--text-secondary);
-    min-width: 80px;
-}
-
-.metric-row .metric-value {
-    font-size: 20px;
-    font-weight: 700;
-    color: var(--accent-primary);
-}
-
-.metric-row .metric-value.small {
-    font-size: 14px;
-}
-
-.metric-row .metric-unit {
-    font-size: 12px;
-    color: var(--text-secondary);
-}
-
-/* UE Metrics */
-.ue-metrics-header {
-    font-size: 14px;
-    font-weight: 600;
+.metric-value {
+    font-size: 24px;
+    font-weight: 800;
     color: var(--text-primary);
-    margin-bottom: 12px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--border-color);
-}
-
-.ue-metrics-list {
-    max-height: 300px;
-    overflow-y: auto;
 }
 
 .ue-card {
-    background: rgba(16, 185, 129, 0.1);
-    border-left: 3px solid var(--success);
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-color);
     border-radius: 8px;
     padding: 12px;
     margin-bottom: 10px;
-    animation: slideIn 0.3s ease-out;
 }
 
-.ue-card .ue-id {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--success);
+.trigger-code {
+    background: #000 !important;
+    color: #00ff9d !important; /* Matrix/Next-G Green */
+    padding: 12px;
+    border-radius: 6px;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 0.75rem;
+    margin: 8px 0;
+    border: 1px solid #222;
+    line-height: 1.5;
+}
+
+/* Styling the new Triggering Intents box */
+.trigger-code {
+    background: #000 !important;
+    color: #00ff9d !important; /* Matrix/Next-G Green */
+    padding: 10px;
+    border-radius: 6px;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 0.75rem;
+    margin: 8px 0;
+    border: 1px solid #222;
+    line-height: 1.4;
+    overflow-x: auto;
+}
+
+/* Styling the Numbered Procedure */
+.procedure-steps {
+    margin: 10px 0;
+    padding-left: 22px;
+    font-size: 0.85rem;
+    color: #e2e8f0;
+}
+
+.procedure-steps li {
+    margin-bottom: 6px;
+    line-height: 1.4;
+}
+
+/* New Section Labels */
+.intent-label-small {
+    font-size: 0.6rem;
+    font-weight: 800;
+    color: #6366f1; /* Accent Color */
+    margin-top: 15px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.no-data {
+    font-style: italic;
+    color: #555;
+    font-size: 0.8rem;
+    padding: 5px 0;
+}
+
+.procedure-steps {
+    margin: 10px 0;
+    padding-left: 20px;
+    font-size: 0.85rem;
+    color: #e2e8f0;
+}
+
+.procedure-steps li {
     margin-bottom: 8px;
-    font-family: 'Courier New', monospace;
+    line-height: 1.4;
 }
 
-.ue-card .ue-metric-row {
+.intent-label-small {
+    font-size: 0.65rem;
+    font-weight: 800;
+    color: var(--accent-secondary);
+    margin-top: 15px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.no-data {
+    font-style: italic;
+    color: #555;
+    font-size: 0.8rem;
+    padding: 5px 0;
+}
+
+.intent-card.hierarchical {
+    border-left: 4px solid var(--accent-secondary);
+    background: rgba(139, 92, 246, 0.05); /* Slight purple tint */
+}
+
+.ue-id {
+    color: var(--accent-secondary);
+    font-weight: 700;
+    margin-bottom: 8px;
+    font-size: 12px;
+}
+
+.ue-metric-row {
     display: flex;
     justify-content: space-between;
     font-size: 12px;
     margin-bottom: 4px;
 }
 
-.ue-card .ue-metric-row .label {
-    color: var(--text-secondary);
+/* --- Animations --- */
+@keyframes slideIn {
+    from { opacity: 0; transform: translateX(-10px); }
+    to { opacity: 1; transform: translateX(0); }
 }
 
-.ue-card .ue-metric-row .value {
-    color: var(--text-primary);
-    font-weight: 600;
-}
-
-/* Responsive */
-@media (max-width: 1200px) {
-    .dashboard-grid {
-        grid-template-columns: 1fr;
-    }
-}
-
-@media (max-width: 768px) {
-    .header-content {
-        flex-direction: column;
-        gap: 16px;
-        align-items: flex-start;
-    }
-}
+/* --- Custom Scrollbar --- */
+.scrollable::-webkit-scrollbar { width: 4px; }
+.scrollable::-webkit-scrollbar-track { background: transparent; }
+.scrollable::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 10px; }

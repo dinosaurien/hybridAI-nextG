@@ -13,7 +13,7 @@ try:
     if os.path.exists(llm_dir) and llm_dir not in sys.path:
         sys.path.insert(0, llm_dir)
         
-    from ain.RL_demo.llm_logic import generate_biased_gpt2_intent
+    from demo.ain.RL_demo.ai_logic import generate_biased_gpt2_intent
     HAS_LLM = True
 except ImportError:
     print("[GPT-2] Warning: llm_logic.py not found. LLM disabled.")

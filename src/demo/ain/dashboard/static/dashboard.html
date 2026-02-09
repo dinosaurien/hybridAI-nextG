@@ -1,13 +1,51 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Network Optimizer - Live Dashboard</title>
-    <link rel="stylesheet" href="dashboard.css">
+    
+    <!-- Link to CSS in the static folder -->
+    <link rel="stylesheet" href="static/dashboard.css">
+    
+    <style>
+        /* Minimal extra styling for the new input panel, 
+           you can move this to dashboard.css if you prefer */
+        .input-panel { 
+            grid-column: 1 / -1; 
+            background: #2d2d2d; 
+            padding: 15px; 
+            border-radius: 8px; 
+            display: flex; 
+            gap: 10px; 
+            align-items: center; 
+            margin-bottom: 20px;
+        }
+        .input-panel input { 
+            flex: 1; 
+            padding: 12px; 
+            background: #1a1a1a; 
+            border: 1px solid #444; 
+            color: white; 
+            border-radius: 4px; 
+            font-size: 1rem;
+        }
+        .input-panel button { 
+            padding: 12px 24px; 
+            background: #007bff; 
+            color: white; 
+            border: none; 
+            border-radius: 4px; 
+            cursor: pointer; 
+            font-weight: bold; 
+            font-size: 1rem;
+            transition: background 0.2s;
+        }
+        .input-panel button:hover { 
+            background: #0056b3; 
+        }
+    </style>
 </head>
-
 <body>
     <div class="container">
         <!-- Header -->
@@ -23,6 +61,13 @@
 
         <!-- Main Grid -->
         <div class="dashboard-grid">
+            
+            <!-- NEW: Intent Input Panel -->
+            <section class="input-panel">
+                <input type="text" id="userIntent" placeholder="💬 Type a new intent (e.g. 'Prepare for concert', 'Reduce power')...">
+                <button id="sendIntentBtn">Inject Intent</button>
+            </section>
+
             <!-- Active Intents Panel -->
             <section class="panel intent-panel">
                 <div class="panel-header">
@@ -87,7 +132,7 @@
         </div>
     </div>
 
-    <script src="dashboard.js"></script>
+    <!-- Link to JS in the static folder -->
+    <script src="static/dashboard.js"></script>
 </body>
-
 </html>
