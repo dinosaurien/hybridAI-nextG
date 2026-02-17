@@ -182,24 +182,12 @@ handleIntent(data) {
         }
 
         const html = Array.from(this.intents.values()).map(intent => {
-            // 1. Format Triggers
-            const triggers = (intent.triggering_intents && intent.triggering_intents.length > 0)
-                ? `<pre class="trigger-code"><code>${intent.triggering_intents.map(t => this.escapeHtml(t)).join('\n')}</code></pre>`
-                : `<p class="no-data">Monitoring network...</p>`;
-
-            // 2. Format Procedure (THE FIX IS HERE)
             const procedureSteps = (intent.procedure || []).map(step => {
-                // If step is an object {action, parameter, rationale}
                 if (typeof step === 'object' && step !== null) {
-                    // Escape EACH piece of text content individually
-                    const action = this.escapeHtml(step.action || 'Action');
-                    const param = step.parameter ? ` | <span class="step-param">${this.escapeHtml(step.parameter)}</span>` : '';
+                    const action = this.escapeHtml(step.action || '');
                     const rationale = step.rationale ? `<div class="step-rationale">${this.escapeHtml(step.rationale)}</div>` : '';
-                    
-                    // Construct the HTML with the now-safe content
-                    return `<li><strong>${action}</strong>${param}${rationale}</li>`;
+                    return `<li><strong>${action}</strong>${rationale}</li>`;
                 }
-                // Fallback for simple strings
                 return `<li>${this.escapeHtml(step)}</li>`;
             }).join('');
 
@@ -209,12 +197,17 @@ handleIntent(data) {
 
             return `
                 <div class="intent-card hierarchical">
-                    <div class="intent-type">${this.escapeHtml(intent.type || 'INTENT ACTIVE')}</div>
-                    <div class="intent-label-small">Triggering Intents</div>
-                    <div class="intent-triggers-container">${triggers}</div>
+                    <!-- Changed 'intent-type' to a descriptive header -->
+                    <div class="intent-description-header">
+                        <strong>Intent:</strong> ${this.escapeHtml(intent.intent_name || 'Optimizing Network Performance')}
+                    </div>
+
                     <div class="intent-label-small">Resulting Procedure</div>
-                    <div class="intent-procedure-container">${procedure}</div>
-                    <div class="intent-scope">Scope: ${this.escapeHtml(intent.scope || 'Global')}</div>
+                    <div class="intent-procedure-container">
+                        ${procedure}
+                    </div>
+                    
+                    <!-- Scope and Triggering Intents are now hidden from UI -->
                 </div>
             `;
         }).join('');

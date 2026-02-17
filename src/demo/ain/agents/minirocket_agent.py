@@ -9,7 +9,7 @@ Supports concurrent monitoring of multiple entities (gNB + multiple UEs).
 import asyncio
 import logging
 from typing import Dict, Any, Optional, List
-from .utils import make_msg
+from ain.bus.messages import make_msg
 from datetime import datetime, timezone, timedelta
 from collections import deque
 from ain.common.log_config import should_log, LOG_DEVIATION

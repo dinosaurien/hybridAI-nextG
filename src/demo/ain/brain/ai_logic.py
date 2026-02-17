@@ -6,9 +6,14 @@ import logging
 from typing import List, Dict
 from enum import Enum, auto
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from ain.agents.otm_logic import OTMGenerator
+from demo.ain.agents.policy_agent import OTMGenerator
 
 logger = logging.getLogger(__name__)
+
+""" 
+This file is not used anymore, we transition to more of memBus architecture with the agents, keep this for reference on what worked 
+previously in case something broke in the new logic...
+"""
 
 class IntentState(Enum):
     MONITORING = auto()
@@ -24,7 +29,7 @@ class IntentParser:
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         self.model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16, device_map="auto")
         
-        # --- FIX: Clear default sampling params to stop warnings ---
+        # Stops warnings from the module when ran
         self.model.generation_config.temperature = None
         self.model.generation_config.top_p = None
         self.model.generation_config.top_k = None
@@ -32,16 +37,36 @@ class IntentParser:
 
     def _get_system_prompt(self):
         return (
-            "You are a 5G RIC Operator. Translate requests into technical procedures.\n"
-            "VALID KNOBS: 'MODIFY_TX_POWER', 'ADJUST_MCS_CAP', 'CHANGE_PRB_WEIGHT'.\n"
+            "You are a 5G Network Orchestrator Engineer. Return JSON ONLY. No markdown. No explanations.\n"
+            "JSON STRUCTURE: {'intent_name': 'sentence', 'procedure': ['step1', 'step2', 'step3']}\n"
+            "Available knobs you can turn:\n"
+            "1. TX_POWER\n"
+            "2. MCS_CAP\n"
+            "3. PRB_WEIGHT\n\n"
+            "Rules:\n"
+            "1. You must return exactly 3 steps in the 'procedure' list.\n"
+            "2. For each knob, you must choose only the direction: INCREASE or DECREASE.\n"
+            "3. The word 'CHANGE' or 'SET' is forbidden. Use strictly 'INCREASE' or 'DECREASE'.\n"
+            "4. Format each step exactly as: '[KNOB]: [DIRECTION] it to [reason]'.\n\n"
+            "OPERATING RANGES:\n"
+            "- TX Power: 2.0 to 20.0 dBm (Standard: 16.0)\n"
+            "- Max MCS: 0 to 28 (Standard: 28)\n"
+            "Respond only with JSON."
+            "The Intent_Name should include information about the anomaly and the triggers"
         )
 
     def devise_plan(self, metric: str, value: float, full_state: Dict) -> Dict:
         load = full_state.get('RRU_PrbUsedDl', 0)
+
+        curr_pow = full_state.get('tx_power_dbm', 'Unknown')
+        curr_mcs = full_state.get('dl_mcs_max', 'Unknown')
+        curr_prb = full_state.get('prb_weight', 'Unknown')
+
         prompt = (
             f"ANOMALY: {metric} is {value:.2f}. STATE: Load {load}%.\n"
+            f"CURRENT CONFIG: TX Power: {curr_pow}dBm, Max MCS: {curr_mcs}, PRB Weight: {curr_prb}.\n"
             "TASK: Create an Operational Procedure.\n"
-            "Return JSON ONLY with keys: 'intent_name', 'triggering_intents', 'procedure', 'scope'."
+            "If a knob is already very low, do not decrease it further. Return JSON ONLY."
         )
         return self._generate(prompt)
 
@@ -63,7 +88,6 @@ class IntentParser:
         inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
         
         with torch.no_grad():
-            # Clean call - defaults are now cleared in __init__
             ids = self.model.generate(
                 **inputs, 
                 max_new_tokens=512, 
@@ -75,6 +99,7 @@ class IntentParser:
         print(f"[DEBUG] RESPONSE:\n{resp}")
         
         try:
+            # json.loads(resp) failed sometimes previously... use regex to extract JSON block only, dont know if needed anymore
             match = re.search(r"(\{.*\})", resp, re.DOTALL)
             return json.loads(match.group(1)) if match else {}
         except: return {}
@@ -92,23 +117,18 @@ class HybridAIController:
         self.triggering_intents = []
         self.procedure = []
         self.assurance_timer = 0
-        # FIX: 20 ticks * 0.5s/tick = 10 second duration
         self.ASSURANCE_DURATION = 20 
 
     def step(self, observations):
-        """
-        Main State Machine Loop
-        """
         actions_out = []
 
-        # 1. ACTIVATING -> THINKING
+        # TODO: We need to somehow have assurance maybe... fix this in future
         if self.state == IntentState.ACTIVATING:
             self.state = IntentState.THINKING
             actions_out.append({"type": "LLM_REQUEST_PLAN"})
 
-        # 2. ASSURANCE -> WITHDRAWAL (After Timer)
+        # TODO: What to do when withdrawing, do we even need it?
         elif self.state == IntentState.ASSURANCE:
-            # FIX: Only send the UI update ONCE at the beginning of the state.
             if self.assurance_timer == 0:
                 actions_out.append({
                     "type": "INTENT_UPDATE",
@@ -120,23 +140,18 @@ class HybridAIController:
             
             self.assurance_timer += 1
             
+            # After 20 seconds (ticks), go straight to MONITORING again
             if self.assurance_timer >= self.ASSURANCE_DURATION:
-                logger.info(f"[CONTROLLER] Assurance timer expired. Withdrawing OTM.")
-                self.state = IntentState.WITHDRAWAL
-
-        # 3. WITHDRAWAL -> MONITORING
-        elif self.state == IntentState.WITHDRAWAL:
-            cleanup_otm = self.otm_gen.create_cleanup_otm("CELL")
-            actions_out.append({"type": "EXECUTE_CLEANUP", "otm": cleanup_otm})
+                logger.info(f"[CONTROLLER] Assurance timer expired. Staying at current config and returning to Monitoring.")
+                
+                self.state = IntentState.MONITORING
+                self.current_deviation = None
+                self.assurance_timer = 0
             
-            # Reset state and clear UI
-            self.state = IntentState.MONITORING
-            self.current_deviation = None
-            self.assurance_timer = 0
-            actions_out.append({"type": "UI_CLEAR"})
+                actions_out.append({"type": "UI_CLEAR"})
 
         return actions_out
-
+    
     def process_deviation(self, dev_data) -> bool:
         if self.state == IntentState.MONITORING:
             self.current_deviation = dev_data
@@ -149,7 +164,7 @@ class HybridAIController:
         self.triggering_intents = outcome.get("triggering_intents", ["Manual"])
         self.procedure = outcome.get("procedure", [])
         self.state = IntentState.ASSURANCE
-        self.assurance_timer = 0 # Reset timer
+        self.assurance_timer = 0 
         return self.otm_gen.create_otm_from_outcome(outcome, f"man_{uuid.uuid4().hex[:4]}")
 
     def apply_llm_plan(self, outcome):
@@ -157,5 +172,5 @@ class HybridAIController:
         self.triggering_intents = outcome.get("triggering_intents", [])
         self.procedure = outcome.get("procedure", [])
         self.state = IntentState.ASSURANCE
-        self.assurance_timer = 0 # Reset timer
+        self.assurance_timer = 0 
         return self.otm_gen.create_otm_from_outcome(outcome, f"auto_{uuid.uuid4().hex[:4]}")
