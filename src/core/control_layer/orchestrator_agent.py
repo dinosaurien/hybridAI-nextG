@@ -44,14 +44,25 @@ class OrchestratorAgent:
                 payload = msg.payload.get("kpi", {})
                 self.current_metrics.update(payload.get("CellMetrics", {}))
 
-            # 2. DRAIN USER INPUTS
             while not q_user.empty():
                 msg = q_user.get_nowait()
-                text = msg.payload.get("text")
-                logger.info(f"[CONTROLLER] Manual Request: {text}")
-                self.state = IntentState.THINKING
-                await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
-                    "type": "manual", "text": text, "state": self.active_config 
+                text = msg.payload.get("text", "").upper()
+                
+                # Map Buttons to Bus Events
+                if "BREAK_SIM: LATENCY_SPIKE" in text:
+                    logger.info("[ORCHESTRATOR] Routing Spike to SimControl")
+                    await self.bus.pub("sim.control", make_msg("sim", "CMD", "v1", {"action": "trigger-traffic-spike"}))
+                
+                elif "BREAK_SIM: PACKET_LOSS" in text:
+                    logger.info("[ORCHESTRATOR] Routing Blockage to SimControl")
+                    await self.bus.pub("sim.control", make_msg("sim", "CMD", "v1", {"action": "trigger-blockage"}))
+                
+                # Standard AI Intents
+                else:
+                    logger.info(f"[ORCHESTRATOR] Manual Request: {text}")
+                    self.state = IntentState.THINKING
+                    await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
+                        "type": "manual", "text": text, "state": self.active_config 
                 }))
 
             # 3. DRAIN PLAN/OTM CREATIONS
@@ -80,20 +91,20 @@ class OrchestratorAgent:
                     # Create Turtle Fact
                     fact_id = f"urn:uuid:kpi-alert-{uuid.uuid4()}"
                     turtle_payload = f"""
-@prefix r: <http://cognitivecore.local/reasoner#> .
-@prefix : <http://example.org/> .
+                    @prefix r: <http://ontology.cf.ericsson.net/reasoner/> .
+                    @prefix : <http://hybridai.org/ontology#> .
 
-<{fact_id}> a r:Message ;
-r:to :KnowledgeBase ;
-:subject "assert" ;
-r:payload [
-    a :KPIDeviation ;
-    :source :MiniRocket ;
-    :kpiStream "{dev['metric']}" ;
-    :deviationValue "{dev['value']}" ;
-    :timestamp "{datetime.datetime.now().isoformat()}Z"
-] .
-"""
+                    <{fact_id}> a r:Message ;
+                    r:to r:KnowledgeBase ;
+                    r:subject "assert" ;
+                    r:payload [
+                        a :KPIDeviation ;
+                        :source :MiniRocket ;
+                        :kpiStream "UE_DRB_PdcpSduDelayDl_UEID" ;
+                        :deviationValue "136.75" ;
+                        :timestamp "2026-03-09T11:41:13Z"
+                    ] .
+                    """
                     # Fire-and-forget task to AWS/CC
                     asyncio.create_task(self._send_to_cognitive_core(turtle_payload))
                     self.state = IntentState.THINKING
@@ -113,6 +124,15 @@ r:payload [
 
             # 6. CRITICAL: THE TICK (Yields control to the WebServer)
             await asyncio.sleep(0.5)
+    
+    async def auto_recovery_timer(self, delay_seconds):
+        """Waits for X seconds, then restores the simulation to normal."""
+        await asyncio.sleep(delay_seconds)
+        logger.info(f"🕒 [SYSTEM] {delay_seconds}s elapsed. Auto-recovering simulation.")
+        # -1 tells ns-3 to restore adaptive MCS
+        await self.bus.pub("sim.control", make_msg("sim", "CMD", "v1", {
+            "action": "set-mcs", "value": -1 
+        }))
 
     async def _send_to_cognitive_core(self, payload: str):
         cc_url = "http://localhost:3020/cc" # Tunnel address

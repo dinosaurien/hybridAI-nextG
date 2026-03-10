@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
-from demo.ain.utils import knowledge_base
+from core.utils import knowledge_base
 
 from core.bus.mem import MemBus
 from core.bus.messages import make_msg

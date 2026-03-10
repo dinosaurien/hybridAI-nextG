@@ -59,6 +59,9 @@ class DashboardClient {
         this.deviations = [];
         this.commands = [];
         this.maxHistoryItems = 50;
+        
+        // NEW: Tracker for fixing the ns-3 cumulative throughput bug
+        this.ueStats = {};
 
         // UI References
         this.statusDot = document.getElementById('statusDot');
@@ -162,7 +165,7 @@ class DashboardClient {
 
     // --- Handlers ---
 
-handleIntent(data) {
+    handleIntent(data) {
         // This receives the message from DashboardServer
         if (!data || Object.keys(data).length === 0) {
             this.intents.clear();
@@ -197,7 +200,6 @@ handleIntent(data) {
 
             return `
                 <div class="intent-card hierarchical">
-                    <!-- Changed 'intent-type' to a descriptive header -->
                     <div class="intent-description-header">
                         <strong>Intent:</strong> ${this.escapeHtml(intent.intent_name || 'Optimizing Network Performance')}
                     </div>
@@ -207,8 +209,7 @@ handleIntent(data) {
                         ${procedure}
                     </div>
                     
-                    <!-- Scope and Triggering Intents are now hidden from UI -->
-                </div>
+                    </div>
             `;
         }).join('');
 
@@ -268,7 +269,21 @@ handleIntent(data) {
         const html = ues.map(ue => {
             const ueId = ue.ue_id || 'Unknown';
             const latency = ue.UE_DRB_PdcpSduDelayDl_UEID;
-            const throughput = ue.UE_DRB_UEThpDl_UEID;
+            
+            const currentRawThp = ue.UE_DRB_UEThpDl_UEID || 0;
+            let trueThpMbps = 0;
+
+            if (this.ueStats[ueId] !== undefined) {
+                let delta = currentRawThp - this.ueStats[ueId];
+                if (delta < 0) delta = 0; 
+                trueThpMbps = delta / 1e6; 
+                
+                // DEBUG TRAP:
+                console.log(`UE: ${ueId} | Raw: ${currentRawThp} | Prev: ${this.ueStats[ueId]} | Delta: ${delta} | Mbps: ${trueThpMbps}`);
+            } else {
+                trueThpMbps = 0; 
+            }
+            this.ueStats[ueId] = currentRawThp;
 
             return `
                 <div class="ue-card">
@@ -279,12 +294,10 @@ handleIntent(data) {
                             <span class="value">${latency.toFixed(2)} ms</span>
                         </div>
                     ` : ''}
-                    ${throughput !== undefined ? `
-                        <div class="ue-metric-row">
-                            <span class="label">Throughput:</span>
-                            <span class="value">${(throughput / 1e6).toFixed(2)} Mbps</span>
-                        </div>
-                    ` : ''}
+                    <div class="ue-metric-row">
+                        <span class="label">Throughput:</span>
+                        <span class="value">${trueThpMbps.toFixed(2)} Mbps</span>
+                    </div>
                 </div>
             `;
         }).join('');

@@ -12,3 +12,4 @@ models/
 data/
 playbooks/
 kpms.csv
+src/core/utils/install_rule.http

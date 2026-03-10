@@ -49,17 +49,23 @@ class UnifiedWebServer:
             return web.Response(text="dashboard.html not found in static folder", status=404)
     
     async def handle_cc_callback(self, request):
-        """Receives forward-chained rule triggers from Cognitive Core."""
+        """Ultra-Loud debug logger for Cognitive Core callbacks."""
+        logger.info("📡 [NETWORK] /api/cc-callback endpoint was touched!")
         try:
-            data = await request.json()
+            # Print headers to see if it's coming through the tunnel
+            logger.info(f"Headers: {dict(request.headers)}")
+            
+            raw_body = await request.text()
+            logger.info(f"Raw Body: {raw_body}")
+            
+            data = json.loads(raw_body)
             logger.info(f"🧠 [COGNITIVE CORE FIRED] {data}")
             
-            # Broadcast to the UI so we can see it!
             await self.broadcast("cc_notification", data)
             return web.json_response({"status": "acknowledged"})
         except Exception as e:
-            logger.error(f"Error reading CC callback: {e}")
-            return web.json_response({"status": "error"}, status=400)
+            logger.error(f"❌ Error in CC callback: {e}")
+            return web.json_response({"status": "error", "reason": str(e)}, status=400)
 
     async def start(self):
         runner = web.AppRunner(self.app)

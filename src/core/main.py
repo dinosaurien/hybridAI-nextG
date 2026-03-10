@@ -7,6 +7,7 @@ from core.bus.mem import MemBus
 from core.utils.knowledge_base import KnowledgeBase
 from core.ui_layer.dashboard.dashboard_server import UnifiedWebServer
 from core.control_layer.orchestrator_agent import OrchestratorAgent
+from core.control_layer.actuator_agent import ActuatorAgent
 from core.control_layer.xapp_adapter import XAppTCPServer
 from core.telemetry_layer.telemetry_agent import TelemetryAgent
 
@@ -21,6 +22,7 @@ async def run_ai_loop_with_membus(tcp_server, target_metric, args):
     
     web_server = UnifiedWebServer(bus, port=args.web_port)
     orchestrator = OrchestratorAgent(bus)
+    actuator = ActuatorAgent(bus)
     telemetry_agents = []
     
     # gNB Level Monitoring
@@ -49,7 +51,7 @@ async def run_ai_loop_with_membus(tcp_server, target_metric, args):
         asyncio.create_task(tcp_server.start()), 
         asyncio.create_task(web_server.start()),
         asyncio.create_task(orchestrator.run()),
-        # asyncio.create_task(actuator.run()),  # Add back when Actuator logic is ready
+        asyncio.create_task(actuator.run())
     ]
     
     for agent in telemetry_agents: 
