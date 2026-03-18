@@ -1,16 +1,13 @@
 #!/bin/bash
 # Deploy script for AI system (AMD ROCm Optimized)
-# Usage: ./deploy_ai.sh [options]
 
 set -e
-# --- START AMD ROCm CONFIGURATION (for Dino hehe) ---
+# AMD ROCm configuration (for Dino hehe)
 export HF_HOME="/opt/rocm_sdk_612/models"
 export PROJECT_ROOT="/home/exposed/Desktop/hybridAI-nextG"
 export LD_LIBRARY_PATH="/opt/rocm_sdk_612/lib:/opt/rocm_sdk_612/lib64:$LD_LIBRARY_PATH"
 export PYTHONPATH="$PROJECT_ROOT/src/demo:$PROJECT_ROOT/src:$PROJECT_ROOT:$PYTHONPATH"
 
-# Get the directory where the script is located
-#SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$PROJECT_ROOT"
 
 # Default values
@@ -103,11 +100,8 @@ if [ "$PLOT_LOSS" = "true" ]; then
     trap plot_loss_function EXIT
 fi
 
-# RUN THE AI
-# Note: we use the absolute path to the ROCm python binary to ensure it ignores system python
 /opt/rocm_sdk_612/bin/python3 "$PROJECT_ROOT/src/demo/ain/RL_demo/xapp_demo_membus.py" "${ARGS[@]}"
 
-# Plot loss after training completes (if not already done by trap)
 if [ "$PLOT_LOSS" = "true" ]; then
     plot_loss_function
 fi

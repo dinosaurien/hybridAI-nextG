@@ -332,9 +332,16 @@
                 this.deviations.unshift(data);
                 if (this.deviations.length > this.maxHistoryItems) this.deviations.pop();
                 this.deviationCount.textContent = this.deviations.length;
-                this.deviationsList.innerHTML = this.deviations.map(d => `
-                    <div class="p-1 border-bottom small">⚠️ ${this.escapeHtml(d.metric)}: <strong>${d.value?.toFixed(2)}</strong></div>
-                `).join('');
+                
+                this.deviationsList.innerHTML = this.deviations.map(d => {
+                    // Safely parse the value
+                    let valStr = 'N/A';
+                    if (d.value !== undefined && d.value !== null) {
+                        const num = Number(d.value);
+                        valStr = !isNaN(num) ? num.toFixed(2) : this.escapeHtml(String(d.value));
+                    }
+                    return `<div class="p-1 border-bottom small">⚠️ ${this.escapeHtml(d.metric)}: <strong>${valStr}</strong></div>`;
+                }).join('');
             }
 
             handleCommand(data) {

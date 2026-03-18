@@ -430,6 +430,9 @@ class XAppTCPServer:
             self._handle_client, self.host, self.port
         )
         logger.info(f"xApp TCP server started on {self.host}:{self.port}")
+
+        if self.bus:
+            asyncio.create_task(self._listen_for_commands())
         
     async def stop(self):
         """Stop the TCP server."""
@@ -666,6 +669,33 @@ class XAppTCPServer:
             writer.close()
             await writer.wait_closed()
             logger.info(f"xApp connection closed: {client_id}")
+
+    async def _listen_for_commands(self):
+        """Background task to listen for RL actuator commands and send them to the xApp."""
+        if not self.bus:
+            return
+            
+        q_cmd = await self.bus.sub("xapp.control")
+        logger.info("[XAPP SERVER] Listening for RL commands on 'xapp.control'")
+        
+        while True:
+            msg = await q_cmd.get()
+            cmd_body = msg.payload
+            
+            if not self.clients:
+                logger.warning("[XAPP SERVER] Received command, but no xApp clients are connected!")
+                continue
+                
+            client_id = list(self.clients.keys())[0]
+            meid = self.meid_map.get(client_id, "unknown")
+            
+            full_command = {
+                "type": "control",
+                "meid": meid,
+                "cmd": cmd_body
+            }
+            
+            await self.send_command(client_id, full_command)
             
     async def send_command(self, client_id: str, command: Dict[str, Any]) -> bool:
         """Send a control command to a client."""

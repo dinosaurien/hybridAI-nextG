@@ -41,6 +41,7 @@ class DeviationMonitor:
         if MINIROCKET_AVAILABLE:
             try:
                 self.minirocket = MiniRocketRT(model_path=model_path, win=window_size)
+                logger.log(LOG_DEVIATION, f"[DEVIATION] Loaded MiniRocket model for {entity_id} on metric {metric}")
             except Exception as e:
                 logger.warning(f"[DEVIATION] Failed to load model for {entity_id}: {e}")
                 self.minirocket = None
@@ -128,10 +129,7 @@ class TelemetryAgent:
         self.debounce_seconds = debounce_seconds
         self.min_deviation_count = min_deviation_count
         
-        # Monitors: Key = Entity ID (e.g., "gnb", "UE_123")
         self.monitors: Dict[str, DeviationMonitor] = {}
-        
-        # Helper to accumulate fragments if needed (mostly for gNB level)
         self.accumulated_kpis: Dict[str, Dict] = {}
         
         if should_log(LOG_DEVIATION):
@@ -158,13 +156,9 @@ class TelemetryAgent:
             if not kpi:
                 continue
             
-            # 1. Process gNB Level (CellMetrics)
-            # Only if this agent is configured for a gNB metric (simple check: not UE_ prefix)
             if not self.metric.startswith("UE_"):
                 await self._process_gnb_metrics(kpi)
                 
-            # 2. Process UE Level (UEMetrics)
-            # Only if this agent is configured for a UE metric (simple check: starts with UE_)
             if self.metric.startswith("UE_"):
                 await self._process_ue_metrics(kpi)
 

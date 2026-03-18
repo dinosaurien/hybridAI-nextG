@@ -41,7 +41,6 @@ class UnifiedWebServer:
         return web.HTTPFound('/static/dashboard.html')
     
     async def handle_index(self, request):
-        # We look for dashboard.html in the static folder
         f = self.static_dir / "dashboard.html"
         if f.exists():
             return web.FileResponse(f)
@@ -49,22 +48,16 @@ class UnifiedWebServer:
             return web.Response(text="dashboard.html not found in static folder", status=404)
     
     async def handle_cc_callback(self, request):
-        """Ultra-Loud debug logger for Cognitive Core callbacks."""
-        logger.info("📡 [NETWORK] /api/cc-callback endpoint was touched!")
         try:
-            # Print headers to see if it's coming through the tunnel
-            logger.info(f"Headers: {dict(request.headers)}")
             
             raw_body = await request.text()
-            logger.info(f"Raw Body: {raw_body}")
             
             data = json.loads(raw_body)
-            logger.info(f"🧠 [COGNITIVE CORE FIRED] {data}")
             
             await self.broadcast("cc_notification", data)
             return web.json_response({"status": "acknowledged"})
         except Exception as e:
-            logger.error(f"❌ Error in CC callback: {e}")
+            logger.error(f"Error in CC callback: {e}")
             return web.json_response({"status": "error", "reason": str(e)}, status=400)
 
     async def start(self):
