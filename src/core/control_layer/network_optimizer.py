@@ -45,6 +45,6 @@ class NetworkOptimizer:
             otm["type"] = f"LLM Optimization: {obj.get('kpi', 'Network')}"
             otm["intent_id"] = f"optimization_task_{obj.get('kpi', 'general')}"
 
-            # 2. Forward directly to the RL Loop and UI
-            logger.info(f"[OPTIMIZER] Forwarding OTM to RL Engine -> intent.current")
-            await self.bus.pub("intent.current", make_msg("optimizer", "INTENT", "v1", otm))
+            logger.info(f"[OPTIMIZER] Forwarding OTM to RL Engine -> intent.current (Trace: {msg.corr_id})")
+            # Final hop to ensure the RL engine receives the same Trace ID
+            await self.bus.pub("intent.current", make_msg("optimizer", "INTENT", "v1", otm, corr_id=msg.corr_id))

@@ -11,6 +11,7 @@ export HF_HUB_DISABLE_XET=1
 export PROJECT_ROOT="/home/exposed/Desktop/hybridAI-nextG"
 export LD_LIBRARY_PATH="/opt/rocm_sdk_612/lib:/opt/rocm_sdk_612/lib64:/opt/rocm_sdk_612/rocm_smi/lib:$LD_LIBRARY_PATH"
 export PATH="/opt/rocm_sdk_612/bin:/opt/rocm_sdk_612/rocm_smi/bin:$PATH"
+export HSA_OVERRIDE_GFX_VERSION=10.3.0
 
 export PYTHONPATH="$PROJECT_ROOT/src:$PYTHONPATH"
 cd "$PROJECT_ROOT"

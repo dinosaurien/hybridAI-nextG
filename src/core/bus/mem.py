@@ -15,7 +15,8 @@ class MemBus:
 
     async def init_xapp_server(self, host: str = "0.0.0.0", port: int = 5000):
         """Initialize TCP server for xApp communication."""
-        from .xapp_server import XAppTCPServer
+        # BUGFIX: The file xapp_server.py does not exist in bus/. It is in control_layer.
+        from core.control_layer.xapp_adapter import XAppTCPServer
         
         self.xapp_server = XAppTCPServer(host, port)
         self.xapp_server.set_bus(self)  # Give server access to bus
@@ -38,15 +39,15 @@ class MemBus:
         for q in list(self._topics.get(topic, [])):
             await q.put(payload)
             
-        # Send relevant updates back to xApp clients
-        if self.xapp_server and topic in ["playbook_generated", "optimization_result", "deviation_detected"]:
+        if self.xapp_server and topic in ["proposer.candidates", "intent.current", "deviation.detected"]:
             notification = {
                 "type": "ai_notification",
                 "topic": topic,
                 "payload": payload,
                 "timestamp": datetime.now().isoformat()
             }
-            await self.xapp_server.broadcast_to_clients(notification)
+            if hasattr(self.xapp_server, 'broadcast_to_clients'):
+                await self.xapp_server.broadcast_to_clients(notification)
 
     async def sub(self, topic: str) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()

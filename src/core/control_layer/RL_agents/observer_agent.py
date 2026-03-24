@@ -18,7 +18,25 @@ class ObserverAgent:
                 last_pb = q_actor.get_nowait().payload.get("playbook")
 
             while not q_intent.empty():
-                self.engine.active_otm = q_intent.get_nowait().payload
+                msg = q_intent.get_nowait()
+                otm = msg.payload
+                self.engine.active_otm = otm
+                
+                # Sync the Observer's underlying Intent dataclass with the OTM
+                # This ensures feature completeness checks and fallback rewards use the right metric
+                obj = otm.get("objective", {})
+                if obj:
+                    raw_metric = obj.get("kpi", "latency").lower()
+                    
+                    # Map semantic KPI to actual CSV metric
+                    metric = "UE_DRB_UEThpDl_UEID" if "thp" in raw_metric else "DRB_PdcpSduDelayDl"
+                    direction = "higher_better" if obj.get("maximize", True) else "lower_better"
+                    target = 50000000.0 if "thp" in raw_metric else 40.0
+                    
+                    self.engine.intent.metric = metric
+                    self.engine.intent.direction = direction
+                    self.engine.intent.target = target
+                    self.engine.intent.type = f"OPTIMIZE_{raw_metric.upper()}"
 
             msg = await q_kpi.get()
             

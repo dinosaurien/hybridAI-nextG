@@ -93,6 +93,11 @@ class DeviationMonitor:
              if value > 100: severity = "critical"
              elif value > 50: severity = "high"
         
+        # State target/baseline explicitly so the LLM gets mathematical context for its OTMs
+        # 40.0ms for Latency/Delay, 50,000,000 bps (50 Mbps) for Throughput
+        target = 40.0 if direction == "lower_better" else 50000000.0
+        baseline = target
+        
         scope = {
             "cell_id": kpi_context.get("cell_id", "unknown"),
             "region": "A",
@@ -104,8 +109,8 @@ class DeviationMonitor:
             "source": "minirocket",
             "metric": self.metric,
             "value": value,
-            "baseline": None,
-            "target": None,
+            "baseline": baseline,
+            "target": target,
             "direction": direction,
             "severity": severity,
             "confidence": 0.9,

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import re
 import uuid
 import datetime
 import torch
@@ -29,43 +28,86 @@ class CognitiveAgent:
         self.kb = kb
         self.executor = ThreadPoolExecutor(max_workers=1)
         
-        model_id = "Qwen/Qwen2.5-7B-Instruct"
+        model_id = "Qwen/Qwen3-4B-Instruct-2507"
         logger.info(f"[INIT] Loading {model_id}...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-        self.model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16, device_map="auto")
+        
+        # FIX 1: Change bfloat16 back to float16. RDNA 2 requires float16.
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id, 
+            torch_dtype=torch.float16, 
+            device_map="cuda",
+            attn_implementation="sdpa" # Fast attention is safe with float16
+        )
         
         device_name = self.model.device
         logger.info(f"[INIT] Cognitive LLM successfully loaded on device: {device_name}")
-        if device_name.type == 'cpu':
-            logger.warning("[INIT] WARNING: Model loaded on CPU! Inference will be very slow.")
+        
+        self.warmup_llm()
+
+    def warmup_llm(self):
+        dummy_prompt = "Warmup: System is detecting a high DRB_PdcpSduDelayDl anomaly. Procedures follow..."
+        
+        inputs = self.tokenizer(dummy_prompt, return_tensors="pt").to(self.model.device)
+        
+        # Force a real generation of at least 50 tokens
+        with torch.no_grad():
+            _ = self.model.generate(
+                **inputs,
+                max_new_tokens=50,
+                use_cache=True,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+            
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     def _generate(self, prompt: str) -> dict:
         msgs = [{"role": "system", "content": "You are a 5G Network AI. Output ONLY valid JSON. No markdown, no explanations."},
                 {"role": "user", "content": prompt}]
         
-        text = self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
+        inputs = self.tokenizer.apply_chat_template(
+            msgs, 
+            tokenize=True, 
+            add_generation_prompt=True, 
+            return_tensors="pt"
+        ).to(self.model.device)
         
         with torch.no_grad():
+            # FIX 2: Cleaned up the generation arguments
             ids = self.model.generate(
                 **inputs, 
                 max_new_tokens=1024, 
                 do_sample=False,
-                temperature=None,  # silences the warnings
-                top_p=None,        
-                top_k=None         
-            ).to("cuda")
-
-        device_name = self.model.device
-        logger.info(f"[INIT] Cognitive LLM successfully loaded on device: {device_name}")
+                use_cache=True, # Cache is perfectly safe when the math isn't corrupted
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
             
-        resp = self.tokenizer.decode(ids[0][len(inputs.input_ids[0]):], skip_special_tokens=True)
+        prompt_length = inputs["input_ids"].shape[1]
+        resp = self.tokenizer.decode(ids[0][prompt_length:], skip_special_tokens=True)
+        
+        logger.info(f"[LLM DEBUG] Raw output: {resp[:200]}...")
         
         try:
-            match = re.search(r"(\{.*\})", resp, re.DOTALL)
-            return json.loads(match.group(1)) if match else {}
-        except:
-            logger.error(f"[COGNITIVE] Failed to parse LLM JSON. Raw output: {resp}")
+            # Find the first balanced JSON object in the output
+            start = resp.find('{')
+            if start == -1:
+                logger.error(f"[COGNITIVE] No JSON found! Raw output: {resp}")
+                return {}
+            depth = 0
+            end = start
+            for i, ch in enumerate(resp[start:], start):
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            return json.loads(resp[start:end + 1])
+        except Exception as e:
+            logger.error(f"[COGNITIVE] JSON Parse Error: {e}. Raw output: {resp}")
             return {}
 
     async def run(self):
@@ -125,12 +167,17 @@ class CognitiveAgent:
             loop = asyncio.get_running_loop()
             otm_json = await loop.run_in_executor(self.executor, self._generate, prompt)
             
+            # Inject runtime variables the LLM can't know
             if otm_json and "objective" in otm_json:
-                # Inject runtime variables the LLM can't know
                 otm_json["metadata"]["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                otm_json["metadata"]["episode"] = f"alert_{uuid.uuid4().hex[:6]}"
-                
-                logger.info(f"[COGNITIVE] OTM Generated Successfully. Publishing to Optimizer.")
-                await self.bus.pub("optimizer.target", make_msg("opt", "NEW_TARGET", "v1", otm_json))
+                otm_json["metadata"]["episode"] = f"alert_{msg.corr_id[:6]}"
+
+                logger.info(f"[COGNITIVE] OTM Generated Successfully. Publishing to Optimizer. (Trace: {msg.corr_id})")
+
+                await self.bus.pub("optimizer.target", make_msg("opt", "NEW_TARGET", "v1", otm_json, corr_id=msg.corr_id))
             else:
-                logger.error("[COGNITIVE] LLM failed to generate a valid OTM.")
+                logger.error("[COGNITIVE] LLM failed to generate a valid OTM. Notifying Orchestrator.")
+                await self.bus.pub("optimizer.target", make_msg("opt", "LLM_FAILURE", "v1", {
+                    "error": "LLM did not produce a valid OTM",
+                    "request_type": payload.get("type"),
+                }, corr_id=msg.corr_id))

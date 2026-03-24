@@ -100,7 +100,7 @@ async def run_ai_loop(tcp_server, args):
     web_server = UnifiedWebServer(bus, port=args.web_port)
     orchestrator = OrchestratorAgent(bus, kb)
     optimizer = NetworkOptimizer(bus, action_space, predictor, cache)
-    actuator = ActuatorAgent(bus)
+    actuator = ActuatorAgent(bus, cell_to_node_map=tcp_server.cell_to_node_map)
     cognitive_agent = CognitiveAgent(bus, kb)
     tmp_intent = Intent(type="REDUCE_LATENCY", metric=args.target_metric, target=40.0)
     observer_engine = RLObserver(predictor, intent=tmp_intent)

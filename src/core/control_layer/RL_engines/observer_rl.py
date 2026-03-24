@@ -63,13 +63,18 @@ class RLObserver:
         self.slo_config = slo_config  # SLO configuration for multi-metric rewards
         
         # Track last known values for each metric (to handle fragmented KPIs)
-        # This allows us to compute rewards even when metrics arrive in different KPI messages
-        self.last_metric_values: Dict[str, float] = {}  # metric_name -> last known value
-        
+        self.last_metric_values: Dict[str, float] = {}
+
         # Track last read file state to avoid duplicate KPI reads
-        self._last_file_mtime: float = 0.0  # Last file modification time
-        self._last_read_timestamp: Optional[str] = None  # Last read KPI timestamp
-        self._last_read_kpi_hash: Optional[str] = None  # Hash of last read KPI content (for duplicate detection)
+        self._last_file_mtime: float = 0.0
+        self._last_read_timestamp: Optional[str] = None
+        self._last_read_kpi_hash: Optional[str] = None
+
+        # State that was previously lazy-initialized via hasattr in step()
+        self.known_kpi_state: Optional[Dict] = None
+        self.steps_since_action: int = 0
+        self.last_action_time: float = 0.0
+        self.active_otm: Optional[Dict] = None
 
         # NEW: Contextual bandit components
         self.enable_contextual_bandit = enable_contextual_bandit and BANDIT_AVAILABLE
@@ -369,15 +374,9 @@ class RLObserver:
             action_type = getattr(action, 'type', '')
             action_params = getattr(action, 'params', {})
             
-            # Situation-specific bonuses
+            # Situation-specific bonuses (only for action types in the active action space)
             if situation == "high_latency":
-                if action_type == "SCHEDULER_POLICY":
-                    policy = action_params.get('policy', '')
-                    if policy == 'MAX_THROUGHPUT':
-                        action_bonus = 0.15  # Good for latency
-                    elif policy == 'PF':
-                        action_bonus = 0.05  # Somewhat good
-                elif action_type == "MCS_CAP":
+                if action_type == "MCS_CAP":
                     mcs_cap = action_params.get('dl_mcs_max', 15)
                     if mcs_cap >= 20:
                         action_bonus = 0.10  # Higher MCS might help latency
@@ -385,21 +384,25 @@ class RLObserver:
                     weight = action_params.get('weight', 1.0)
                     if weight > 1.0:
                         action_bonus = 0.08  # More PRBs might help latency
-            
+                elif action_type == "TX_POWER":
+                    tx = action_params.get('txPowerDbm', 30)
+                    if tx >= 45:
+                        action_bonus = 0.12  # Higher power improves signal for latency
+
             elif situation == "low_throughput":
                 if action_type == "PRB_WEIGHT":
                     weight = action_params.get('weight', 1.0)
                     if weight > 1.0:
                         action_bonus = 0.20  # Excellent for throughput
-                elif action_type == "SCHEDULER_POLICY":
-                    policy = action_params.get('policy', '')
-                    if policy == 'PF':
-                        action_bonus = 0.15  # Good for throughput
                 elif action_type == "MCS_CAP":
                     mcs_cap = action_params.get('dl_mcs_max', 15)
                     if mcs_cap >= 18:
                         action_bonus = 0.10  # Higher MCS for throughput
-            
+                elif action_type == "TX_POWER":
+                    tx = action_params.get('txPowerDbm', 30)
+                    if tx >= 45:
+                        action_bonus = 0.10  # Higher power for throughput
+
             elif situation == "high_error_rate":
                 if action_type == "MCS_CAP":
                     mcs_cap = action_params.get('dl_mcs_max', 15)
@@ -409,16 +412,16 @@ class RLObserver:
                     weight = action_params.get('weight', 1.0)
                     if weight > 1.0:
                         action_bonus = 0.10  # More resources for reliability
-            
+
             elif situation == "poor_quality":
                 if action_type == "MCS_CAP":
                     mcs_cap = action_params.get('dl_mcs_max', 15)
                     if mcs_cap <= 18:
                         action_bonus = 0.12  # Conservative MCS
-                elif action_type == "SCHEDULER_POLICY":
-                    policy = action_params.get('policy', '')
-                    if policy == 'PF':
-                        action_bonus = 0.08  # Fair scheduling for quality
+                elif action_type == "TX_POWER":
+                    tx = action_params.get('txPowerDbm', 30)
+                    if tx >= 45:
+                        action_bonus = 0.08  # Higher power for quality
             
             bonus += action_bonus
         
@@ -488,7 +491,7 @@ class RLObserver:
         
         return metrics
     
-    # ---------- Converts OTM's to SLO targets. ----------
+    # Converts OTM's to SLO targets.
     def _convert_otm_to_slo_targets(self, otm: dict) -> dict:
         """
         Converts the Declarative OTM JSON into the dictionary format expected by 
@@ -706,11 +709,24 @@ class RLObserver:
                         curr_val = curr_metrics.get(metric, "N/A")
                         logger.info(f"[REWARD]   - {metric}: prev={prev_val}, curr={curr_val}, target={config['target']}, weight={config['weight']}")
                 
-                multi_reward = self.slo_reward_calculator.calculate_multi_metric_reward(
-                    prev_metrics=prev_metrics,
-                    curr_metrics=curr_metrics,
-                    slo_targets=slo_targets
-                )
+                # BUGFIX: Calculate multi-metric reward with explicit math since calculate_multi_metric_reward is missing
+                multi_reward = 0.0
+                for m_key, config in slo_targets.items():
+                    p_val = prev_metrics.get(m_key)
+                    c_val = curr_metrics.get(m_key)
+                    if p_val is not None and c_val is not None and not np.isnan(p_val) and not np.isnan(c_val):
+                        p = float(p_val)
+                        c = float(c_val)
+                        t = float(config["target"])
+                        w = float(config.get("weight", 1.0))
+                        
+                        if config["direction"] == "lower_better":
+                            d_rel = (p - c) / max(abs(p), 1e-6)
+                            viol = 1.0 if c > t else 0.0
+                        else:
+                            d_rel = (c - p) / max(abs(p), 1e-6)
+                            viol = 1.0 if c < t else 0.0
+                        multi_reward += w * (d_rel - viol)
                 
                 action_penalty = self.intent.action_cost * float(actions_len)
                 multi_reward -= action_penalty
@@ -752,12 +768,24 @@ class RLObserver:
                         curr_val = curr_metrics.get(metric, "N/A")
                         logger.info(f"[REWARD]   {metric}: prev={prev_val}, curr={curr_val}, target={config['target']}, weight={config['weight']}")
                 
-                # Calculate multi-metric reward
-                multi_reward = self.slo_reward_calculator.calculate_multi_metric_reward(
-                    prev_metrics=prev_metrics,
-                    curr_metrics=curr_metrics,
-                    slo_targets=slo_targets
-                )
+                # BUGFIX: Calculate multi-metric reward with explicit math since calculate_multi_metric_reward is missing
+                multi_reward = 0.0
+                for m_key, config in slo_targets.items():
+                    p_val = prev_metrics.get(m_key)
+                    c_val = curr_metrics.get(m_key)
+                    if p_val is not None and c_val is not None and not np.isnan(p_val) and not np.isnan(c_val):
+                        p = float(p_val)
+                        c = float(c_val)
+                        t = float(config["target"])
+                        w = float(config.get("weight", 1.0))
+                        
+                        if config["direction"] == "lower_better":
+                            d_rel = (p - c) / max(abs(p), 1e-6)
+                            viol = 1.0 if c > t else 0.0
+                        else:
+                            d_rel = (c - p) / max(abs(p), 1e-6)
+                            viol = 1.0 if c < t else 0.0
+                        multi_reward += w * (d_rel - viol)
                 
                 if should_log(LOG_REWARD):
                     logger.info(f"[REWARD] Multi-metric reward (before action cost): {multi_reward:.6f}")
@@ -929,27 +957,15 @@ class RLObserver:
         # Calculate contextual bonus
         context_bonus = self._calculate_context_bonus(last_playbook, self.current_context)
         
-        # Use SLO reward calculator for single metric
-        try:
-            enhanced_reward = self.slo_reward_calculator.calculate_contextual_reward(
-                prev_metrics=prev_metrics,
-                curr_metrics=curr_metrics,
-                intent=self.intent,
-                num_actions=actions_len,
-                context_bonus=context_bonus
-            )
-            
-            if should_log(LOG_REWARD):
-                logger.debug(f"[REWARD] Enhanced reward: base={base_reward:.4f}, context_bonus={context_bonus:.4f}, "
-                            f"enhanced={enhanced_reward:.4f}, actions={actions_len}")
-            
-            return enhanced_reward
-            
-        except Exception as e:
-            if should_log(LOG_REWARD):
-                logger.warning(f"[REWARD] Enhanced reward calculation failed: {e}, using base_reward + context_bonus")
-            return base_reward + context_bonus
-
+        # BUGFIX: Calculate simple single-metric contextual reward since calculate_contextual_reward is missing
+        enhanced_reward = base_reward + context_bonus
+        
+        if should_log(LOG_REWARD):
+            logger.debug(f"[REWARD] Enhanced reward: base={base_reward:.4f}, context_bonus={context_bonus:.4f}, "
+                        f"enhanced={enhanced_reward:.4f}, actions={actions_len}")
+        
+        return enhanced_reward
+    
     # ---------- Public API ----------
     def step(self, last_playbook, kpi_dict: Optional[Dict] = None) -> Optional[np.ndarray]:
         """Enhanced step with contextual intelligence and feature completeness checking."""
@@ -965,7 +981,7 @@ class RLObserver:
             return None
 
         # STATEFUL QUERY: Merge updates into persistent state to handle fragmented E2 messages
-        if not hasattr(self, 'known_kpi_state'):
+        if self.known_kpi_state is None:
              from copy import deepcopy
              self.known_kpi_state = deepcopy(kpi_update)
         else:
@@ -984,10 +1000,6 @@ class RLObserver:
         # Use the accumulated full state for processing
         kpi = self.known_kpi_state
 
-        # STABILIZATION: Initialize counter if needed
-        if not hasattr(self, 'steps_since_action'):
-            self.steps_since_action = 0
-            
         # Extract features and check completeness
         row, completeness = self._extract_features_row(kpi)
         
@@ -1032,9 +1044,6 @@ class RLObserver:
         s2 = self._update_window(row)  # [W, F] - already cleaned (no NaN values)
         
         # STABILIZATION: Time-based check
-        if not hasattr(self, 'last_action_time'):
-            self.last_action_time = 0
-            
         current_time = time.time()
         time_since_action = current_time - self.last_action_time
         stabilization_period = 2.0 # Reduced from 20.0s to accelerate training
