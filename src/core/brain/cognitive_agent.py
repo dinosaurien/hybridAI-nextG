@@ -32,12 +32,11 @@ class CognitiveAgent:
         logger.info(f"[INIT] Loading {model_id}...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         
-        # FIX 1: Change bfloat16 back to float16. RDNA 2 requires float16.
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id, 
             torch_dtype=torch.float16, 
             device_map="cuda",
-            attn_implementation="sdpa" # Fast attention is safe with float16
+            attn_implementation="sdpa"
         )
         
         device_name = self.model.device
@@ -74,12 +73,11 @@ class CognitiveAgent:
         ).to(self.model.device)
         
         with torch.no_grad():
-            # FIX 2: Cleaned up the generation arguments
             ids = self.model.generate(
                 **inputs, 
                 max_new_tokens=1024, 
                 do_sample=False,
-                use_cache=True, # Cache is perfectly safe when the math isn't corrupted
+                use_cache=True,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id
             )
