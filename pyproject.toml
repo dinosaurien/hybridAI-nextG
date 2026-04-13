@@ -5,7 +5,7 @@ description = ""
 authors = ["Wilhelm Rauston <wilhelm.rauston@gmail.com>"]
 license = "Apache-2.0"
 readme = "README.md"
-packages = [{ include = "ain", from = "src/demo" }]
+packages = [{ include = "core", from = "src" }]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
@@ -25,11 +25,8 @@ rdflib = "^7.6.0"
 torch = "^2.10.0"
 
 [tool.poetry.scripts]
-train_minirocket = "src.demo.ain.pipeline.train_minirocket:main"
-run_loop = "src.demo.ain.pipeline.run_loop:main"
-
-run_demo = "src.demo.ain.loop.pseudo_demo:main"
-train_predictor = "src.demo.ain.loop.predictor:main"
+train_minirocket = "core.train_minirocket:main"
+train_minirocket_xapp = "core.train_minirocket_xapp:main"
 
 [tool.poetry.group.dev.dependencies]
 black = "^25.9.0"

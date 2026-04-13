@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from core.bus.messages import make_msg
 from core.common.log_config import should_log, LOG_INTENT
@@ -20,6 +19,7 @@ class ProposerAgent:
         q_intent = await self.bus.sub("intent.current")
 
         while True:
+            # Drain any pending intent updates (non-blocking)
             while not q_intent.empty():
                 msg = q_intent.get_nowait()
                 self.active_otm = msg.payload
@@ -31,44 +31,69 @@ class ProposerAgent:
                     if should_log(LOG_INTENT):
                         logger.debug(f"[PROPOSER] OTM re-confirmed (episode={new_id}).")
 
-            while not q_state.empty():
-                msg = q_state.get_nowait()
-                self.last_state = msg.payload
+            # Block until the next state window arrives (no polling)
+            msg = await q_state.get()
+            self.last_state = msg.payload
 
-                if self.active_otm and self.last_state:
-                    try:
-                        situation = self.last_state.get("situation", "normal") if isinstance(self.last_state, dict) else "normal"
+            if self.active_otm and self.last_state:
+                try:
+                    situation = self.last_state.get("situation", "normal") if isinstance(self.last_state, dict) else "normal"
 
-                        objective = self.active_otm.get("objective", {})
-                        semantic_kpi = objective.get("kpi", "latency").lower()
+                    objective = self.active_otm.get("objective", {})
+                    semantic_kpi = objective.get("kpi", "latency").lower()
 
-                        if "thp" in semantic_kpi or "throughput" in semantic_kpi:
-                            proposer_intent = "THR_DL"
-                        elif "power" in semantic_kpi or "energy" in semantic_kpi:
-                            proposer_intent = "ENERGY_SAVING"
-                        else:
-                            proposer_intent = "LATENCY_P95"
+                    if "thp" in semantic_kpi or "throughput" in semantic_kpi:
+                        proposer_intent = "THR_DL"
+                    elif "power" in semantic_kpi or "energy" in semantic_kpi:
+                        proposer_intent = "ENERGY_SAVING"
+                    else:
+                        proposer_intent = "LATENCY_P95"
 
-                        intent_meta = {"intent": proposer_intent, "scope": "GLOBAL"}
+                    # Extract constraint hints from OTM so the sampler can bias generation.
+                    # When multiple constraints target the same KPI with the same direction,
+                    # keep the strictest (lowest threshold for "le"/"lt", highest for "ge"/"gt").
+                    constraint_hints = {}
+                    for c in self.active_otm.get("constraints", []):
+                        kpi = c.get("kpi", "")
+                        op = c.get("operator", "le")
+                        threshold = c.get("threshold")
+                        if kpi and threshold is not None:
+                            thr = float(threshold)
+                            existing = constraint_hints.get(kpi)
+                            if existing is None:
+                                constraint_hints[kpi] = {"operator": op, "threshold": thr}
+                            elif op in ("le", "lt") and existing["operator"] in ("le", "lt"):
+                                if thr < existing["threshold"]:
+                                    constraint_hints[kpi] = {"operator": op, "threshold": thr}
+                            elif op in ("ge", "gt") and existing["operator"] in ("ge", "gt"):
+                                if thr > existing["threshold"]:
+                                    constraint_hints[kpi] = {"operator": op, "threshold": thr}
+                            else:
+                                # Conflicting directions — keep the first (LLM-generated)
+                                pass
 
-                        playbooks = ProposerSampler.sample_contextual_playbooks(
-                            action_space=self.action_space,
-                            N=CANDIDATE_N,
-                            K=PLAYBOOK_K,
-                            epsilon=0.3,
-                            intent_meta=intent_meta,
-                            cache=self.knowledge_base,
-                            situation=situation
-                        )
+                    intent_meta = {
+                        "intent": proposer_intent,
+                        "scope": "GLOBAL",
+                        "constraint_hints": constraint_hints,
+                    }
 
-                        await self.bus.pub("proposer.candidates", make_msg(
-                            "proposer.candidates", "PLAYBOOKS", "playbooks.v1",
-                            {"candidates": playbooks}
-                        ))
+                    playbooks = ProposerSampler.sample_contextual_playbooks(
+                        action_space=self.action_space,
+                        N=CANDIDATE_N,
+                        K=PLAYBOOK_K,
+                        epsilon=0.3,
+                        intent_meta=intent_meta,
+                        cache=self.knowledge_base,
+                        situation=situation
+                    )
 
-                        self.last_state = None
+                    await self.bus.pub("proposer.candidates", make_msg(
+                        "proposer.candidates", "PLAYBOOKS", "playbooks.v1",
+                        {"candidates": playbooks}
+                    ))
 
-                    except Exception as e:
-                        logger.error(f"[PROPOSER] Error generating playbooks: {e}", exc_info=True)
+                    self.last_state = None
 
-            await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"[PROPOSER] Error generating playbooks: {e}", exc_info=True)

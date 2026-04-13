@@ -28,12 +28,12 @@ class UnifiedWebServer:
         
         self.static_dir = Path(__file__).resolve().parent / "static"
 
-        # 2. ROUTES
         self.app.router.add_get('/ws', self.handle_websocket)
         self.app.router.add_post('/api/intent', self.handle_post_intent)
         self.app.router.add_get('/', self.redirect_to_dashboard)
         self.app.router.add_static('/static/', self.static_dir, name='static')
         self.app.router.add_post('/api/cc-callback', self.handle_cc_callback)
+        self.app.router.add_post('/api/schedule/cancel', self.handle_cancel_schedule)
             
 
     async def redirect_to_dashboard(self, request):
@@ -47,6 +47,18 @@ class UnifiedWebServer:
         else:
             return web.Response(text="dashboard.html not found in static folder", status=404)
     
+    async def handle_cancel_schedule(self, request):
+        """Cancel a scheduled intent by ID."""
+        try:
+            data = await request.json()
+            schedule_id = data.get("schedule_id")
+            if schedule_id:
+                await self.bus.pub("schedule.cancel", make_msg("ui", "CANCEL", "v1", {"schedule_id": schedule_id}))
+                return web.json_response({"status": "ok"})
+            return web.json_response({"status": "error", "msg": "No schedule_id provided"}, status=400)
+        except Exception as e:
+            return web.json_response({"status": "error", "msg": str(e)}, status=500)
+
     async def handle_cc_callback(self, request):
         try:
             
@@ -83,9 +95,17 @@ class UnifiedWebServer:
         await ws.prepare(request)
         self.websockets.add(ws)
         try:
-            async for _ in ws: pass 
-        finally: 
-            self.websockets.remove(ws)
+            async for raw_msg in ws:
+                if raw_msg.type == web.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(raw_msg.data)
+                        # Route intent messages from the frontend to the MemBus
+                        if data.get("type") == "intent" and data.get("text"):
+                            asyncio.create_task(self.bus_adapter.process_intent(data["text"]))
+                    except json.JSONDecodeError:
+                        logger.debug(f"[UI LAYER] Non-JSON WebSocket message ignored")
+        finally:
+            self.websockets.discard(ws)
         return ws
 
     async def broadcast(self, msg_type, data):
@@ -98,10 +118,12 @@ class UnifiedWebServer:
         q_intent = await self.bus.sub("intent.current")
         q_dev = await self.bus.sub("deviation.broadcast")
         q_cmd = await self.bus.sub("command.notify")
-        q_kpi = await self.bus.sub("kpi.raw") 
+        q_kpi = await self.bus.sub("kpi.raw")
+        q_schedule = await self.bus.sub("schedule.update")
+        q_procedure = await self.bus.sub("procedure.update")
 
         current_metrics, all_active_ues = {}, {}
-        
+
         while True:
             # Aggregate KPIs
             while not q_kpi.empty():
@@ -118,5 +140,7 @@ class UnifiedWebServer:
             while not q_cmd.empty():
                 cmd_data = (q_cmd.get_nowait()).payload
                 await self.broadcast("command", {"command": cmd_data.get("command"), "params": cmd_data.get("params")})
-                
+            while not q_schedule.empty(): await self.broadcast("schedule", (q_schedule.get_nowait()).payload)
+            while not q_procedure.empty(): await self.broadcast("procedure", (q_procedure.get_nowait()).payload)
+
             await asyncio.sleep(0.1)

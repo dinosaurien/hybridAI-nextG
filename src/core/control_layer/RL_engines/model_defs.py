@@ -18,8 +18,8 @@ class StateEncoder(nn.Module): # Takes a tensor representing the state and turns
 class ActionEncoder(nn.Module): # Takes our actions (JSON style) and turns them into dense vectors using nn.MLP
     def __init__(self, embed_dim: int = 64, cell_cap: int = 16, slice_cap: int = 16):
         super().__init__()
-        self.type_dim = 5
-        self.scope_dim = 3
+        self.type_dim = 3   # MCS_CAP, TX_POWER, REPORTING
+        self.scope_dim = 1  # CELL only
         self.cell_cap = cell_cap
         self.slice_cap = slice_cap
         self.param_dim = 8

@@ -25,20 +25,6 @@ class ActorAgent:
                 {"playbook": best_playbook, "q": best_q}
             ))
 
-            if hasattr(best_playbook, 'actions'):
-                for action in best_playbook.actions:
-                    # Skip empty NOOPs so we don't spam the UI
-                    if action.type == "REPORTING" and action.params.get("noop"):
-                        continue
-                    
-                    cmd_payload = {
-                        "command": action.type,
-                        "params": action.params
-                    }
-                    
-                    # Push to the UI
-                    await self.bus.pub("command.notify", make_msg("actor", "CMD", "v1", cmd_payload))
-            
             try:
                 filepath = self.actor.make_and_save(best_playbook)
                 logger.debug(f"[ACTOR] Playbook saved to {filepath}")

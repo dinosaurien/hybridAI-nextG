@@ -1,77 +1,89 @@
 import numpy as np
 import logging
-from typing import Dict, Any
+from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 
+
 class SLORewardCalculator:
-    """Enhanced SLO-based reward calculator bridging LLM OTMs and RL logic."""
-    
-    def __init__(self, action_cost: float = 0.01, reward_clip: float = 100.0):
-        self.action_cost = action_cost
-        # Increased clip from 20 to 100 so the constraint penalties aren't ignored
-        self.reward_clip = reward_clip 
-        
-    def calculate_reward(self, 
-                         prev_state: Dict[str, Any],
-                         curr_state: Dict[str, Any], 
-                         active_otm: Dict[str, Any],
-                         num_actions: int = 1) -> float:
-        """Calculate reward using the dynamic LLM OTM and relative improvements."""
-        
-        if not active_otm:
+    """Minimal SLO-based reward calculator.
+
+    Maps the LLM's declarative OTM (one objective, N constraints) with the
+    RL agent's scalar reward signal using two terms:
+
+        reward = improvement(objective) - weight * sum(violation²(constraints))
+
+    The improvement term is a relative change that rewards moving the objective
+    metric in the desired direction.  The violation term is a quadratic penalty
+    that activates only when a constraint threshold is breached, penalising
+    large breaches disproportionately harder than marginal ones.
+    """
+
+    def __init__(self, reward_clip: float = 20.0):
+        self.reward_clip = reward_clip
+
+    def calculate_reward(
+        self,
+        prev_metrics: Dict[str, float],
+        curr_metrics: Dict[str, float],
+        objective_metric: str,
+        maximize: bool = True,
+        constraints: List[Dict] = None,
+        violation_weight: float = 5.0,
+    ) -> float:
+        """Minimal reward: objective improvement minus quadratic constraint violation.
+
+        Args:
+            prev_metrics: KPI values from the previous observation.
+            curr_metrics: KPI values from the current observation.
+            objective_metric: The KPI to optimise (e.g. ``UE_DRB_UEThpDl_UEID``).
+            maximize: ``True`` to maximise the objective, ``False`` to minimise.
+            constraints: List of constraint dicts, each with:
+                ``"metric"``    - KPI name,
+                ``"operator"``  - ``"le"``/``"lt"`` (upper bound) or ``"ge"``/``"gt"`` (lower bound),
+                ``"threshold"`` - limit value.
+            violation_weight: Multiplier applied to the total squared violation.
+
+        Returns:
+            Clipped scalar reward in ``[-reward_clip, reward_clip]``.
+        """
+        if constraints is None:
+            constraints = []
+
+        prev_obj = prev_metrics.get(objective_metric)
+        curr_obj = curr_metrics.get(objective_metric)
+
+        # Bail out if objective metrics are missing
+        if prev_obj is None or curr_obj is None:
             return 0.0
 
-        reward = 0.0
-        constraint_violated = False
+        # Reward the Objective — relative improvement
+        if maximize:
+            improvement = (curr_obj - prev_obj) / max(abs(prev_obj), 1e-6)
+        else:
+            improvement = (prev_obj - curr_obj) / max(abs(prev_obj), 1e-6)
 
-        # Helper to extract flat KPI from nested kpi.raw format
-        def _get_kpi(state, kpi_name):
-            cell_metrics = state.get("CellMetrics", {})
-            ue_metrics = state.get("UEMetrics", [])
-            
-            if kpi_name in cell_metrics:
-                return float(cell_metrics[kpi_name])
-            
-            ue_vals = [float(ue.get(kpi_name, 0)) for ue in ue_metrics if kpi_name in ue]
-            return sum(ue_vals) / len(ue_vals) if ue_vals else None
+        # Penalize ALL violated constraints — quadratic penalty
+        # Squaring makes small overshoots near-negligible while large
+        # breaches receive disproportionately heavy penalties.
+        total_violation = 0.0
+        for con in constraints:
+            curr_con = curr_metrics.get(con["metric"])
+            if curr_con is None:
+                continue
 
-        # Parses the LLM's dynamically generated rules
-        for c in active_otm.get("constraints", []):
-            kpi = c.get("kpi")
-            op = c.get("operator")
-            threshold = float(c.get("threshold", 0.0))
-            
-            val = _get_kpi(curr_state, kpi)
-            if val is not None:
-                violation = False
-                if op == "le" and val > threshold: violation = True
-                elif op == "lt" and val >= threshold: violation = True
-                elif op == "ge" and val < threshold: violation = True
-                elif op == "gt" and val <= threshold: violation = True
-                
-                if violation:
-                    constraint_violated = True
-                    reward -= 50.0  # penalty for violating LLM SLA
+            threshold = con["threshold"]
+            op = con["operator"]
 
-        if not constraint_violated:
-            obj = active_otm.get("objective", {})
-            if obj:
-                kpi = obj.get("kpi")
-                maximize = obj.get("maximize", True)
-                
-                prev_val = _get_kpi(prev_state, kpi)
-                curr_val = _get_kpi(curr_state, kpi)
-                
-                if prev_val is not None and curr_val is not None:
-                    if maximize:
-                        delta_raw = curr_val - prev_val
-                    else:
-                        delta_raw = prev_val - curr_val
-                        
-                    delta_rel = delta_raw / max(abs(prev_val), 1e-6)
-                    reward += (delta_rel * 10.0) 
+            if op in ("le", "lt") and curr_con > threshold:
+                rel = (curr_con - threshold) / max(abs(threshold), 1e-6)
+                total_violation += rel ** 2
+            elif op in ("ge", "gt") and curr_con < threshold:
+                rel = (threshold - curr_con) / max(abs(threshold), 1e-6)
+                total_violation += rel ** 2
 
-        reward -= (self.action_cost * num_actions)
+        total_violation *= violation_weight
 
+        # Final Reward: Improvement minus Penalty
+        reward = improvement - total_violation
         return float(np.clip(reward, -self.reward_clip, self.reward_clip))

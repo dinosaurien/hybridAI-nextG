@@ -5,11 +5,10 @@ from enum import Enum
 import itertools
 import numpy as np
 
-# Import your existing types
 try:
     from ain.common.types import ControlAction, Playbook
 except ImportError:
-    # Fallback definitions if types not available
+    # Fallback
     from dataclasses import dataclass as dc
     
     @dc

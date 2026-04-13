@@ -27,9 +27,11 @@ class DeviationMonitor:
         self.debounce_seconds = debounce_seconds
         self.min_deviation_count = min_deviation_count
         
-        # Debouncing state
-        self.last_deviation_time: Optional[datetime] = None
+        # State tracking — edge-triggered: only report on normal→deviation transition
+        self.in_deviation_state: bool = False
+        self.consecutive_normal: int = 0
         self.deviation_buffer: deque = deque(maxlen=min_deviation_count)
+        self.last_deviation_time: Optional[datetime] = None
         self.last_reported_value: Optional[float] = None
         
         # Feature accumulation (if needed per-entity)
@@ -62,26 +64,45 @@ class DeviationMonitor:
             if value > threshold:
                 is_deviation = True
 
-        # Debouncing logic
+        # Edge-triggered debounce: only report on normal→deviation transition
         self.deviation_buffer.append(is_deviation)
         now = datetime.now(timezone.utc)
-        
-        should_report = False
-        if is_deviation and len(self.deviation_buffer) >= self.min_deviation_count:
-            if all(list(self.deviation_buffer)[-self.min_deviation_count:]):
-                if self.last_deviation_time is None:
-                    should_report = True
-                else:
-                    time_since_last = (now - self.last_deviation_time).total_seconds()
-                    if time_since_last >= self.debounce_seconds:
-                        should_report = True
-        
-        if should_report:
-            self.last_deviation_time = now
-            self.last_reported_value = value
-            return self._create_deviation_event(value, kpi_context)
-            
-        return None
+
+        if not is_deviation:
+            self.consecutive_normal += 1
+            # Reset deviation state after enough consecutive normal readings
+            if self.consecutive_normal >= self.min_deviation_count and self.in_deviation_state:
+                self.in_deviation_state = False
+                logger.info(f"[DEVIATION] {self.entity_id}: Conditions returned to normal "
+                            f"({self.consecutive_normal} consecutive normal readings)")
+            return None
+
+        # Is deviation — reset normal counter
+        self.consecutive_normal = 0
+
+        # Need min_deviation_count consecutive deviations to confirm
+        if len(self.deviation_buffer) < self.min_deviation_count:
+            return None
+        if not all(list(self.deviation_buffer)[-self.min_deviation_count:]):
+            return None
+
+        # Already in deviation state — don't re-report (edge-triggered)
+        if self.in_deviation_state:
+            return None
+
+        # Debounce: don't re-trigger too fast after a recovery→deviation cycle
+        if self.last_deviation_time is not None:
+            time_since_last = (now - self.last_deviation_time).total_seconds()
+            if time_since_last < self.debounce_seconds:
+                return None
+
+        # Transition: normal → deviation — report it
+        self.in_deviation_state = True
+        self.last_deviation_time = now
+        self.last_reported_value = value
+        logger.info(f"[DEVIATION] {self.entity_id}: NEW deviation detected "
+                    f"{self.metric}={value:.2f} (edge-triggered)")
+        return self._create_deviation_event(value, kpi_context)
 
     def _create_deviation_event(self, value: float, kpi_context: Dict[str, Any]) -> Dict[str, Any]:
         """Create deviation event dict."""
@@ -154,7 +175,8 @@ class TelemetryAgent:
     async def run(self):
         """Subscribe to KPI stream and detect deviations."""
         q = await self.bus.sub("kpi.raw")
-        
+        logger.info(f"[TELEMETRY] Agent online for metric: {self.metric} (window={self.window_size}, debounce={self.debounce_seconds}s, min_count={self.min_deviation_count})")
+
         while True:
             msg = await q.get()
             kpi = msg.payload.get("kpi", {})

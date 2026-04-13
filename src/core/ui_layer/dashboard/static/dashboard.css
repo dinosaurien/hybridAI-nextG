@@ -127,6 +127,55 @@ body {
     animation: slideIn 0.3s ease-out;
 }
 
+.procedure-badge {
+    display: inline-block;
+    background: rgba(139, 92, 246, 0.2);
+    border: 1px solid var(--accent-secondary, #8b5cf6);
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 0.7rem;
+    color: var(--accent-secondary, #8b5cf6);
+    margin-left: 8px;
+    vertical-align: middle;
+}
+
+.procedure-status {
+    font-size: 0.8rem;
+    color: #a5f3fc;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 6px;
+    padding: 4px 10px;
+    margin-bottom: 8px;
+}
+
+.otm-details {
+    margin-top: 10px;
+}
+
+.otm-details summary {
+    cursor: pointer;
+    font-size: 0.8rem;
+    color: var(--accent-secondary, #8b5cf6);
+    font-weight: 600;
+    user-select: none;
+}
+
+.otm-json {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border-color, #334155);
+    border-radius: 8px;
+    padding: 12px;
+    margin-top: 8px;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: #a5f3fc;
+    overflow-x: auto;
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 .intent-type {
     font-size: 1.1rem;
     font-weight: 600;

@@ -24,6 +24,13 @@ except ImportError:
     print("[Warning] Contextual bandit components not found. Using basic mode.")
 
 
+DEFAULT_FEATURES = [
+    "DRB_PdcpSduDelayDl", "RRU_PrbUsedDl", "DRB_MeanActiveUeDl",
+    "TB_TotNbrDlInitial_Qpsk", "TB_TotNbrDlInitial_16Qam", "TB_TotNbrDlInitial_64Qam",
+    "UE_DRB_PdcpSduDelayDl_UEID", "UE_DRB_UEThpDl_UEID",
+    "UE_RRU_PrbUsedDl_UEID", "UE_DRB_EstabSucc_5QI_UEID",
+]
+
 @dataclass
 class Intent:
     type: str                 # e.g., "REDUCE_LATENCY", "INCREASE_THROUGHPUT"
@@ -44,10 +51,8 @@ class RLObserver:
         features: Optional[List[str]] = None,
         use_internal_encoder: bool = False,
         device: Optional[torch.device] = None,
-        enable_contextual_bandit: bool = True,  # NEW: Feature flag
+        enable_contextual_bandit: bool = True,
         min_feature_completeness: float = 0.5,  # Minimum fraction of features that must be present (0.0-1.0)
-        enable_multi_metric_reward: bool = True,  # NEW: Enable multi-metric reward calculation
-        slo_config: Optional[Any] = None,  # NEW: SLO configuration for multi-metric rewards
     ):
         self.predictor = predictor
         self.intent = intent
@@ -59,8 +64,6 @@ class RLObserver:
         self.last_state_win: Optional[np.ndarray] = None  # [W, F]
         self.use_internal_encoder = use_internal_encoder
         self.min_feature_completeness = min_feature_completeness
-        self.enable_multi_metric_reward = enable_multi_metric_reward
-        self.slo_config = slo_config  # SLO configuration for multi-metric rewards
         
         # Track last known values for each metric (to handle fragmented KPIs)
         self.last_metric_values: Dict[str, float] = {}
@@ -81,7 +84,6 @@ class RLObserver:
         if self.enable_contextual_bandit:
             self.context_extractor = ContextExtractor(window_size=window)
             self.slo_reward_calculator = SLORewardCalculator(
-                action_cost=intent.action_cost,
                 reward_clip=intent.reward_clip
             )
             self.current_context: Optional[NetworkContext] = None
@@ -89,32 +91,13 @@ class RLObserver:
             print("[Observer] Contextual bandit mode enabled")
         else:
             print("[Observer] Basic mode (no contextual bandit)")
-        
-        # Log multi-metric reward status
-        if self.enable_multi_metric_reward and self.slo_config:
-            slo_metrics = list(self.slo_config.slos.keys()) if hasattr(self.slo_config, 'slos') else []
-            print(f"[Observer] Static multi-metric reward enabled: tracking {len(slo_metrics)} SLO metrics")
-        elif self.enable_multi_metric_reward:
-            # Change this line!
-            print("[Observer] Dynamic multi-metric reward enabled. Waiting for OTMs from Cognitive Core to define SLO targets.")
 
         # Select features - USE ACTUAL CSV COLUMN NAMES
         # gNB LEVEL (no UE prefix): DRB_MeanActiveUeDl, DRB_PdcpSduDelayDl, RRU_PrbUsedDl, 
         #                            TB_TotNbrDlInitial_16Qam, TB_TotNbrDlInitial_64Qam, TB_TotNbrDlInitial_Qpsk
         # UE LEVEL (UE_ prefix): UE_DRB_PdcpSduDelayDl_UEID, UE_DRB_UEThpDl_UEID, UE_RRU_PrbUsedDl_UEID, etc.
         # Note: UE metrics are aggregated into cell-level metrics (sum/max) for global context
-        self.features = features or [
-            "DRB_PdcpSduDelayDl",           # Delay metric (gNB level)
-            "RRU_PrbUsedDl",                # PRB usage (gNB level)
-            "DRB_MeanActiveUeDl",           # Active UE count (gNB level)
-            "TB_TotNbrDlInitial_Qpsk",      # QPSK transport blocks (gNB level)
-            "TB_TotNbrDlInitial_16Qam",     # 16QAM transport blocks (gNB level)
-            "TB_TotNbrDlInitial_64Qam",     # 64QAM transport blocks (gNB level)
-            "UE_DRB_PdcpSduDelayDl_UEID",   # UE delay (aggregated max from UE level)
-            "UE_DRB_UEThpDl_UEID",          # UE throughput (aggregated sum from UE level)
-            "UE_RRU_PrbUsedDl_UEID",        # UE PRB usage (aggregated sum from UE level)
-            "UE_DRB_EstabSucc_5QI_UEID",    # DRB establishment success (aggregated sum from UE level)
-        ]
+        self.features = features or list(DEFAULT_FEATURES)
 
         # Simple fixed scalers (adjust as you like) - USE ACTUAL CSV COLUMN NAMES
         self.scalers = {
@@ -490,57 +473,6 @@ class RLObserver:
             metrics["prb_used_dl"] = safe_float(cell["prb_used_dl"])
         
         return metrics
-    
-    # Converts OTM's to SLO targets.
-    def _convert_otm_to_slo_targets(self, otm: dict) -> dict:
-        """
-        Converts the Declarative OTM JSON into the dictionary format expected by 
-        SLORewardCalculator to mathematically resolve Clashing Intents.
-        """
-        slo_targets = {}
-        
-        # Helper to map OTM semantic names to actual CSV metric names
-        def map_metric(name):
-            n = name.lower()
-            if "throughput" in n or "tpt" in n: return "UE_DRB_UEThpDl_UEID"
-            if "latency" in n or "delay" in n: return "DRB_PdcpSduDelayDl"
-            if "power" in n: return "tx_power_dbm"
-            return name
-
-        # Map the Main Objective (Weighted heavily to ensure DQN focuses on it)
-        obj = otm.get("objective", {})
-        if obj:
-            metric = map_metric(obj.get("kpi", "latency"))
-            direction = "higher_better" if obj.get("maximize", True) else "lower_better"
-            
-            # Baseline targets if optimizing without a hard limit
-            target_val = 50000000 if "thp" in metric.lower() else 40.0 
-            
-            slo_targets[metric] = {
-                "target": target_val, 
-                "direction": direction, 
-                "weight": 2.0  # Main objective gets priority weight
-            }
-
-        # Map the Constraints (These act as penalties to resolve clashes)
-        for c in otm.get("constraints", []):
-            metric = map_metric(c.get("kpi", ""))
-            threshold = float(c.get("threshold", 0.0))
-            op = c.get("operator", "ge")
-            
-            direction = "higher_better" if op in ["ge", "gt"] else "lower_better"
-            
-            # Unit conversions for the backend
-            if c.get("unit") == "Mbps" and "thp" in metric.lower():
-                threshold *= 1e6
-
-            slo_targets[metric] = {
-                "target": threshold,
-                "direction": direction,
-                "weight": 1.5  # Constraints act as strong violation penalties
-            }
-
-        return slo_targets
 
     # ---------- Enhanced Reward Calculation ----------
     def _compute_reward(self, prev_kpi: Dict, curr_kpi: Dict, actions_len: int) -> float:
@@ -621,30 +553,18 @@ class RLObserver:
         
         return reward
 
-    def _compute_enhanced_reward(self, prev_kpi: Dict, curr_kpi: Dict, 
+    def _compute_enhanced_reward(self, prev_kpi: Dict, curr_kpi: Dict,
                                last_playbook: Any) -> float:
-        """Enhanced reward computation with contextual bonus and optional multi-metric support."""
+        """Compute reward using the active OTM from the LLM, with single-metric fallback."""
         actions_len = len(getattr(last_playbook, "actions", []))
         
         # Extract metrics for reward calculation
         prev_metrics = self._extract_metrics_dict(prev_kpi)
         curr_metrics = self._extract_metrics_dict(curr_kpi)
         
-        # CRITICAL: Save last_metric_values BEFORE updating it
-        # We need to use the PREVIOUS state for merging, not the updated state
-        # Otherwise, if we update last_metric_values from curr_metrics first, then use it for prev,
-        # we'll make prev=curr when metrics are fragmented
         saved_last_metric_values = self.last_metric_values.copy()
         
         # Merge metrics from both KPIs to handle fragmented KPIs
-        # Fragmented KPIs may have different metrics in prev vs curr, so we need to merge them
-        # Strategy: 
-        # 1. Get all unique metrics from both KPIs (union of all metrics)
-        # 2. For each metric:
-        #    - prev: use prev_kpi value if available, otherwise SAVED last known value (from BEFORE this step)
-        #    - curr: use curr_kpi value if available, otherwise SAVED last known value (from BEFORE this step)
-        # 3. This ensures we compare the same set of metrics while preserving actual differences
-        
         # Get all unique metrics from both KPIs
         all_metrics = set(list(prev_metrics.keys()) + list(curr_metrics.keys()))
         
@@ -670,7 +590,7 @@ class RLObserver:
                 if should_log(LOG_REWARD):
                     logger.debug(f"[REWARD] Using saved last known value for curr {metric}: {saved_last_metric_values[metric]:.4f} (not in curr_kpi)")
         
-        # NOW update last_metric_values AFTER merging (for next iteration)
+        # update last_metric_values after merging (for next iteration)
         for metric, value in curr_metrics.items():
             if not np.isnan(value):
                 self.last_metric_values[metric] = value
@@ -684,287 +604,61 @@ class RLObserver:
         prev_metrics = merged_prev_metrics
         curr_metrics = merged_curr_metrics
         
-        # Check if this was a NOOP/idle action
-        is_noop = False
-        actions = getattr(last_playbook, "actions", [])
-        if len(actions) == 1 and actions[0].type == "REPORTING":
-            is_noop = True
-
         if should_log(LOG_REWARD):
             logger.info(f"[REWARD] Computing reward: has_otm={hasattr(self, 'active_otm') and self.active_otm is not None}, actions_len={actions_len}")
             logger.info(f"[REWARD] Prev Metrics: {{k: round(v, 2) for k, v in prev_metrics.items() if not np.isnan(v)}}")
             logger.info(f"[REWARD] Curr Metrics: {{k: round(v, 2) for k, v in curr_metrics.items() if not np.isnan(v)}}")
 
-        # Check for an active OTM from the LLM and use it for multi-metric rewards.
-        active_otm = getattr(self, 'active_otm', None)
+        # Primary path: OTM from the LLM (minimal reward: improvement − violation²)
+        active_otm = self.active_otm
         if active_otm:
             try:
-                # Dynamically convert the OTM JSON into the SLO dict the calculator needs.
-                slo_targets = self._convert_otm_to_slo_targets(active_otm)
-                
-                if should_log(LOG_REWARD):
-                    logger.info(f"[REWARD] Using OTM-driven multi-metric reward with {len(slo_targets)} targets.")
-                    for metric, config in slo_targets.items():
-                        prev_val = prev_metrics.get(metric, "N/A")
-                        curr_val = curr_metrics.get(metric, "N/A")
-                        logger.info(f"[REWARD]   - {metric}: prev={prev_val}, curr={curr_val}, target={config['target']}, weight={config['weight']}")
-                
-                # BUGFIX: Calculate multi-metric reward with explicit math since calculate_multi_metric_reward is missing
-                multi_reward = 0.0
-                for m_key, config in slo_targets.items():
-                    p_val = prev_metrics.get(m_key)
-                    c_val = curr_metrics.get(m_key)
-                    if p_val is not None and c_val is not None and not np.isnan(p_val) and not np.isnan(c_val):
-                        p = float(p_val)
-                        c = float(c_val)
-                        t = float(config["target"])
-                        w = float(config.get("weight", 1.0))
-                        
-                        if config["direction"] == "lower_better":
-                            d_rel = (p - c) / max(abs(p), 1e-6)
-                            viol = 1.0 if c > t else 0.0
-                        else:
-                            d_rel = (c - p) / max(abs(p), 1e-6)
-                            viol = 1.0 if c < t else 0.0
-                        multi_reward += w * (d_rel - viol)
-                
-                action_penalty = self.intent.action_cost * float(actions_len)
-                multi_reward -= action_penalty
-                clip_val = self.intent.reward_clip
-                multi_reward = float(np.clip(multi_reward, -clip_val, clip_val))
-                
-                if should_log(LOG_REWARD):
-                    logger.info(f"[REWARD] OTM Multi-metric reward (post-penalty): {multi_reward:.4f}")
-                
-                if self.enable_contextual_bandit and self.current_context:
-                    context_bonus = self._calculate_context_bonus(last_playbook, self.current_context)
-                    multi_reward += context_bonus
-                    multi_reward = float(np.clip(multi_reward, -clip_val, clip_val))
-                
-                return multi_reward
-                
-            except Exception as e:
-                if should_log(LOG_REWARD):
-                    import traceback
-                    logger.warning(f"[REWARD] OTM multi-metric reward failed: {e}, falling back to single metric.")
-                    logger.debug(f"[REWARD] Traceback: {traceback.format_exc()}")
-        
-        # Try multi-metric reward if enabled and SLO config available
-        if self.enable_multi_metric_reward and self.slo_config and hasattr(self.slo_config, 'slos'):
-            try:
-                # Build SLO targets dict for multi-metric reward
-                slo_targets = {}
-                for metric, slo in self.slo_config.slos.items():
-                    slo_targets[metric] = {
-                        'target': slo['target'],
-                        'direction': slo['direction'],
-                        'weight': 1.0 if slo.get('priority') == 'high' else 0.5 if slo.get('priority') == 'medium' else 0.25
-                    }
-                
-                if should_log(LOG_REWARD):
-                    logger.info(f"[REWARD] Using multi-metric reward calculation with {len(slo_targets)} SLO metrics")
-                    for metric, config in slo_targets.items():
-                        prev_val = prev_metrics.get(metric, "N/A")
-                        curr_val = curr_metrics.get(metric, "N/A")
-                        logger.info(f"[REWARD]   {metric}: prev={prev_val}, curr={curr_val}, target={config['target']}, weight={config['weight']}")
-                
-                # BUGFIX: Calculate multi-metric reward with explicit math since calculate_multi_metric_reward is missing
-                multi_reward = 0.0
-                for m_key, config in slo_targets.items():
-                    p_val = prev_metrics.get(m_key)
-                    c_val = curr_metrics.get(m_key)
-                    if p_val is not None and c_val is not None and not np.isnan(p_val) and not np.isnan(c_val):
-                        p = float(p_val)
-                        c = float(c_val)
-                        t = float(config["target"])
-                        w = float(config.get("weight", 1.0))
-                        
-                        if config["direction"] == "lower_better":
-                            d_rel = (p - c) / max(abs(p), 1e-6)
-                            viol = 1.0 if c > t else 0.0
-                        else:
-                            d_rel = (c - p) / max(abs(p), 1e-6)
-                            viol = 1.0 if c < t else 0.0
-                        multi_reward += w * (d_rel - viol)
-                
-                if should_log(LOG_REWARD):
-                    logger.info(f"[REWARD] Multi-metric reward (before action cost): {multi_reward:.6f}")
-                
-                # Apply action cost and clip
-                action_penalty = self.intent.action_cost * float(actions_len)
-                multi_reward -= action_penalty
-                
-                # Use configured clip range instead of hardcoded 20.0 to prevent gradient explosion
-                clip_val = self.intent.reward_clip
-                multi_reward = float(np.clip(multi_reward, -clip_val, clip_val))
-                
-                if should_log(LOG_REWARD):
-                    logger.info(f"[REWARD] Multi-metric reward (after action cost {action_penalty:.4f}): {multi_reward:.6f}")
-                
-                # Calculate violations and track which metrics were used
-                violations = []
-                metrics_used = []
-                metrics_missing = []
-                for metric, slo in self.slo_config.slos.items():
-                    try:
-                        # Use merged prev_metrics (which includes last known values)
-                        prev_val = prev_metrics.get(metric)
-                        curr_val = curr_metrics.get(metric)
-                        
-                        # If curr is missing, try to use last known value
-                        if curr_val is None or (isinstance(curr_val, float) and np.isnan(curr_val)):
-                            curr_val = self.last_metric_values.get(metric)
-                        
-                        if prev_val is None or curr_val is None:
-                            metrics_missing.append(metric)
-                            continue
-                        if isinstance(prev_val, float) and np.isnan(prev_val):
-                            metrics_missing.append(metric)
-                            continue
-                        if isinstance(curr_val, float) and np.isnan(curr_val):
-                            metrics_missing.append(metric)
-                            continue
-                        
-                        # Format metrics_used string safely
-                        try:
-                            metrics_used_str = f"{metric}(prev={prev_val:.2f},curr={curr_val:.2f})"
-                        except (ValueError, TypeError):
-                            metrics_used_str = f"{metric}(prev={prev_val},curr={curr_val})"
-                        metrics_used.append(metrics_used_str)
-                        
-                        value = float(curr_val)
-                        target = float(slo['target'])
-                        direction = slo['direction']
-                        is_violating = False
-                        if direction == "lower_better" and value > target:
-                            is_violating = True
-                        elif direction == "higher_better" and value < target:
-                            is_violating = True
-                        elif direction == "moderate_better":
-                            # For moderate_better, violation is being far from target in either direction
-                            distance = abs(value - target)
-                            tolerance = slo.get('tolerance', 0.1) * target  # tolerance is relative
-                            if distance > tolerance:
-                                is_violating = True
-                        if is_violating:
-                            try:
-                                violations.append(f"{metric}={value:.2f} (target={target:.2f})")
-                            except Exception:
-                                violations.append(f"{metric}={value} (target={target})")
-                    except Exception as e:
-                        # Skip this metric if there's an error processing it
-                        logger.debug(f"[REWARD] Error processing metric {metric} for violation tracking: {e}")
-                        continue
-                
-                if should_log(LOG_REWARD):
-                    # Calculate weight_sum safely
-                    try:
-                        used_metric_names = [m.split('(')[0] for m in metrics_used if '(' in m]
-                        weight_sum_actual = sum(slo_targets.get(m, {}).get('weight', 1.0) for m in used_metric_names if m in slo_targets)
-                    except Exception as e:
-                        weight_sum_actual = 0.0
-                        logger.debug(f"[REWARD] Error calculating weight_sum: {e}")
-                    
-                    logger.info(f"[REWARD] Multi-metric reward: {multi_reward:.4f}, "
-                               f"metrics_used={len(metrics_used)}/{len(self.slo_config.slos)}, "
-                               f"weight_sum={weight_sum_actual:.2f}")
-                    if metrics_used:
-                        logger.info(f"[REWARD]   Metrics used: {', '.join(metrics_used[:5])}")
-                    if metrics_missing:
-                        logger.warning(f"[REWARD]   Metrics missing: {', '.join(metrics_missing)}")
-                    if violations:
-                        logger.info(f"[REWARD]   Violations: {', '.join(violations)}")
-                    else:
-                        logger.info(f"[REWARD]   All tracked SLOs met")
-                
-                # Add contextual bonus if available
-                if self.enable_contextual_bandit and self.current_context:
-                    context_bonus = self._calculate_context_bonus(last_playbook, self.current_context)
-                    multi_reward += context_bonus
-                    multi_reward = float(np.clip(multi_reward, -self.intent.reward_clip, self.intent.reward_clip))
-                    if should_log(LOG_REWARD) and context_bonus != 0:
-                        logger.debug(f"[REWARD] Added context bonus: {context_bonus:.4f}, final reward: {multi_reward:.4f}")
-                
-                return multi_reward
-                
-            except Exception as e:
-                if should_log(LOG_REWARD):
-                    import traceback
-                    logger.warning(f"[REWARD] Multi-metric reward calculation failed: {e}, falling back to single metric")
-                    logger.debug(f"[REWARD] Exception traceback: {traceback.format_exc()}")
-                # Fall through to single-metric calculation
-        
-        # Fallback to single-metric reward
-        if should_log(LOG_REWARD):
-            logger.warning(f"[REWARD] Using single-metric reward (fallback). "
-                          f"enable_multi_metric={self.enable_multi_metric_reward}, "
-                          f"has_slo_config={self.slo_config is not None}")
-        # Use merged metrics for base reward calculation (handles fragmentation)
-        metric = self.intent.metric
-        target = self.intent.target
-        direction = self.intent.direction
-        
-        # Get values from merged metrics (which include history fill)
-        prev_val = prev_metrics.get(metric)
-        curr_val = curr_metrics.get(metric)
-        
-        # Fallback to alternative names if primary metric not found
-        if prev_val is None or curr_val is None:
-            metric_alternatives = {
-                "DRB_PdcpSduDelayDl": ["delay_p95_ms", "UE_PDCP_Delay_DL_ms"],
-                "delay_p95_ms": ["DRB_PdcpSduDelayDl", "UE_PDCP_Delay_DL_ms"],
-                "UE_DRB_PdcpSduDelayDl_UEID": ["UE_PDCP_Delay_DL_ms"],
-            }
-            alternatives = metric_alternatives.get(metric, [])
-            for alt in alternatives:
-                if prev_val is None: prev_val = prev_metrics.get(alt)
-                if curr_val is None: curr_val = curr_metrics.get(alt)
-        
-        # Calculate base reward
-        if prev_val is not None and curr_val is not None and not np.isnan(prev_val) and not np.isnan(curr_val):
-            prev = float(prev_val)
-            curr = float(curr_val)
-            
-            if direction == "lower_better":
-                delta_raw = (prev - curr)
-                delta_rel = delta_raw / max(abs(prev), 1e-6)
-                violation = 1.0 if curr > target else 0.0
-            else:  # higher_better
-                delta_raw = (curr - prev)
-                delta_rel = delta_raw / max(abs(prev), 1e-6)
-                violation = 1.0 if curr < target else 0.0
+                from core.common.types import map_otm_metric_name
 
-            r = delta_rel
-            r -= self.intent.action_cost * float(actions_len)
-            r -= violation
-            clip = self.intent.reward_clip
-            base_reward = float(np.clip(r, -clip, clip))
-            
-            if should_log(LOG_REWARD):
-                logger.info(f"[REWARD] Base reward (derived from merged metrics): metric={metric}, "
-                           f"prev={prev:.4f}, curr={curr:.4f}, target={target:.4f}, "
-                           f"delta_rel={delta_rel:.4f}, reward={base_reward:.4f}")
-        else:
-            base_reward = 0.0
-            if should_log(LOG_REWARD):
-                 logger.warning(f"[REWARD] Metric '{metric}' missing in merged metrics (prev={prev_val}, curr={curr_val}), returning 0.0")
-        
-        if not self.enable_contextual_bandit or not self.current_context:
-            if should_log(LOG_REWARD):
-                logger.info(f"[REWARD] Returning base reward (no contextual bandit): {base_reward:.6f}")
-            return base_reward
-        
-        # Calculate contextual bonus
-        context_bonus = self._calculate_context_bonus(last_playbook, self.current_context)
-        
-        # BUGFIX: Calculate simple single-metric contextual reward since calculate_contextual_reward is missing
-        enhanced_reward = base_reward + context_bonus
-        
-        if should_log(LOG_REWARD):
-            logger.debug(f"[REWARD] Enhanced reward: base={base_reward:.4f}, context_bonus={context_bonus:.4f}, "
-                        f"enhanced={enhanced_reward:.4f}, actions={actions_len}")
-        
-        return enhanced_reward
+                # Extract objective from OTM
+                obj = active_otm.get("objective", {})
+                objective_metric = map_otm_metric_name(obj.get("kpi", ""))
+                maximize = obj.get("maximize", True)
+
+                # Extract constraints from OTM (maps 1:1 to the OTM JSON)
+                constraints = []
+                for c in active_otm.get("constraints", []):
+                    metric = map_otm_metric_name(c.get("kpi", ""))
+                    threshold = float(c.get("threshold", 0))
+                    op = c.get("operator", "le")
+
+                    # Unit conversion for the backend
+                    if c.get("unit") == "Mbps" and "thp" in metric.lower():
+                        threshold *= 1e6
+
+                    constraints.append({
+                        "metric": metric,
+                        "operator": op,
+                        "threshold": threshold,
+                    })
+
+                reward = self.slo_reward_calculator.calculate_reward(
+                    prev_metrics=prev_metrics,
+                    curr_metrics=curr_metrics,
+                    objective_metric=objective_metric,
+                    maximize=maximize,
+                    constraints=constraints,
+                )
+
+                if should_log(LOG_REWARD):
+                    logger.info(f"[REWARD] OTM reward={reward:.4f}, obj={objective_metric}, "
+                               f"maximize={maximize}, constraints={len(constraints)}")
+
+                return reward
+
+            except Exception as e:
+                if should_log(LOG_REWARD):
+                    import traceback
+                    logger.warning(f"[REWARD] OTM reward failed: {e}, falling back to single-metric")
+                    logger.debug(f"[REWARD] Traceback: {traceback.format_exc()}")
+
+        # Fallback is the inherited single metric intent-based reward
+        return self._compute_reward(prev_kpi, curr_kpi, actions_len)
     
     # ---------- Public API ----------
     def step(self, last_playbook, kpi_dict: Optional[Dict] = None) -> Optional[np.ndarray]:
@@ -1004,7 +698,7 @@ class RLObserver:
         row, completeness = self._extract_features_row(kpi)
         
         # Check if we have enough features to proceed
-        # RELAXATION: If we have the target metric (critical for reward), proceed even if completeness is low
+        # If we have the target metric (critical for reward), proceed even if completeness is low
         # This matches the logic in ObserverBridge to prevent stalling
         cell_metrics = kpi.get("CellMetrics", {})
         has_critical_metric = False
@@ -1034,7 +728,7 @@ class RLObserver:
         if should_log(LOG_OBSERVER) and completeness < self.min_feature_completeness and has_critical_metric:
              logger.debug(f"[OBSERVER] Proceeding with low completeness ({completeness:.1%}) because critical metric {self.intent.metric} is present")
         
-        # NEW: Extract context (only if we have enough features)
+        # Extract context (only if we have enough features)
         if self.enable_contextual_bandit:
             context = self._extract_context(kpi)
             if context:
@@ -1087,7 +781,7 @@ class RLObserver:
             t_push = time.time() - t0
             
             t0 = time.time()
-            # OPTIMIZATION: Only train every 10 steps (check replay size or counter) -> actually we trigger every action now (every 5s)
+            # Only train every 10 steps (check replay size or counter) -> actually we trigger every action now (every 5s)
             # Since we only run this block every 5s, we can afford to train every time!
             # It takes ~0.2s, which is fine every 5s.
             self.predictor.learn_step()
@@ -1098,8 +792,8 @@ class RLObserver:
                 logger.warning(f"[PERF] Slow step detected: reward={t_reward:.4f}s, encode={t_encode:.4f}s, push={t_push:.4f}s, learn={t_learn:.4f}s")
 
         # Update previous pointers
-        # CRITICAL: Make a deep copy of the KPI dict to avoid reference issues
-        # If we store a reference, modifications to the dict will affect both prev and curr
+        # - Make a deep copy of the KPI dict to avoid reference issues
+        # - If we store a reference, modifications to the dict will affect both prev and curr
         from copy import deepcopy
         self.last_kpi_raw = deepcopy(kpi)
         self.last_state_win = s2.copy()  # Store cleaned state window
@@ -1112,7 +806,7 @@ class RLObserver:
              
         return s2  # current window (cleaned, no NaN)
 
-    # ---------- NEW: Public context access methods ----------
+    # Public context access methods
     def get_current_context(self) -> Optional[NetworkContext]:
         """Get current network context."""
         return self.current_context

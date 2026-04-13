@@ -26,29 +26,16 @@ PLAYBOOK_K = 3         # actions per playbook
 CANDIDATE_N = 5        # number of candidate playbooks per decision
 COOLDOWN_STEPS = 1     # cooldown per (type, scope, entity)
 
-ActionType = str   # {"SCHEDULER_POLICY","MCS_CAP","PRB_WEIGHT","SLICE_QOS","TX_POWER","POWER_CONTROL","REPORTING"}
-ScopeType = str    # {"CELL","UE","SLICE"}
+ActionType = str   # {"MCS_CAP","TX_POWER","REPORTING"}
+ScopeType = str    # {"CELL"}
 
 # Action parameter ranges - define min, max, and step for continuous/discrete sampling
 # These would later be sent by the actual network as a "what can we change now" message
-
-# Scheduler policies (discrete choices)
-SCHEDULER_POLICIES = ["PF", "RR", "MAX_THROUGHPUT", "WEIGHTED_FAIR", "QOS_AWARE"]
 
 # MCS (Modulation and Coding Scheme) - range: 0-28, typically use 12-28
 MCS_DL_MIN = 12
 MCS_DL_MAX = 28
 MCS_DL_STEP = 2  # Sample every 2 MCS levels
-
-# PRB Weight - range: 0.5 to 2.0, step 0.1
-PRB_WEIGHT_MIN = 0.5
-PRB_WEIGHT_MAX = 2.0
-PRB_WEIGHT_STEP = 0.1
-
-# Slice QoS Weight - range: 0.5 to 2.0, step 0.1
-SLICE_WEIGHT_MIN = 0.5
-SLICE_WEIGHT_MAX = 2.0
-SLICE_WEIGHT_STEP = 0.1
 
 # TX Power - range: 30.0 to 60.0 dBm, step 1.0
 TX_POWER_DBM_MIN = 30.0
@@ -58,15 +45,6 @@ TX_POWER_DBM_STEP = 1.0
 def generate_mcs_values(min_val=MCS_DL_MIN, max_val=MCS_DL_MAX, step=MCS_DL_STEP):
     """Generate MCS values in range."""
     return list(range(min_val, max_val + 1, step))
-
-def generate_weight_values(min_val=PRB_WEIGHT_MIN, max_val=PRB_WEIGHT_MAX, step=PRB_WEIGHT_STEP):
-    """Generate weight values in range."""
-    values = []
-    current = min_val
-    while current <= max_val:
-        values.append(round(current, 1))
-        current += step
-    return values
 
 def generate_tx_power_values(min_val=TX_POWER_DBM_MIN, max_val=TX_POWER_DBM_MAX, step=TX_POWER_DBM_STEP):
     """Generate TX power values in range."""
@@ -81,40 +59,24 @@ def generate_tx_power_values(min_val=TX_POWER_DBM_MIN, max_val=TX_POWER_DBM_MAX,
 class ActionSpace:
     cells: List[str]
     slices: List[str]
-    
+
     def all_atomic_actions(self) -> List[ControlAction]:
         """Generate all possible atomic actions from defined ranges.
-        RESTRICTED: Only MCS_CAP, TX_POWER, and PRB_WEIGHT are supported.
+        Only MCS_CAP and TX_POWER are actuated over E2 in ns-3.
         """
         acts: List[ControlAction] = []
-        
-        # Generate MCS and TX power values from ranges
+
         mcs_values = generate_mcs_values()
-        prb_weight_values = generate_weight_values(PRB_WEIGHT_MIN, PRB_WEIGHT_MAX, PRB_WEIGHT_STEP)
-        # slice_weight_values removed (SLICE_QOS not supported)
         tx_power_values = generate_tx_power_values()
-        
-        # Cell-level actions
+
         for c in self.cells:
-            # REMOVED: SCHEDULER_POLICY (not supported)
-            
-            # MCS Cap (from range)
             for m in mcs_values:
                 acts.append(ControlAction("MCS_CAP", "CELL", cell_id=c, params={"dl_mcs_max": m}))
-            
-            # TX Power (from range)
+
             for tx_power in tx_power_values:
                 acts.append(ControlAction("TX_POWER", "CELL", cell_id=c, params={"txPowerDbm": tx_power}))
-        
-        # Slice-level actions
-        for s in self.slices:
-            # PRB Weight (from range)
-            for w in prb_weight_values:
-                acts.append(ControlAction("PRB_WEIGHT", "SLICE", slice_id=s, params={"weight": w}))
-            
-            # REMOVED: SLICE_QOS (not supported)
-        
-        # Include a NOOP-like action (kept for safety/fallback)
+
+        # NOOP action (kept for safety/fallback)
         acts.append(ControlAction("REPORTING", "CELL", params={"noop": True}))
         return acts
 
@@ -325,22 +287,53 @@ class ProposerSampler:
         seeds = cache.sample_contextual(intent_meta, situation, m=min(2, N)) if cache else []
         playbooks: List[Playbook] = []
 
+        # Extract constraint hints from intent_meta (e.g. {"dl_mcs_max": {"operator": "le", "threshold": 20}})
+        constraint_hints = (intent_meta or {}).get("constraint_hints", {})
+
+        # OTM constraint KPI names don't always match action param keys
+        _CONSTRAINT_TO_PARAM = {
+            "tx_power_dbm": "txPowerDbm",
+        }
+
+        def _action_matches_constraints(action: ControlAction) -> bool:
+            """Check if an action's params fall within OTM constraint hints."""
+            for kpi, hint in constraint_hints.items():
+                param_key = _CONSTRAINT_TO_PARAM.get(kpi, kpi)
+                val = action.params.get(param_key)
+                if val is None:
+                    continue
+                op = hint.get("operator", "le")
+                thr = hint.get("threshold", 0)
+                if op in ("le", "lt") and float(val) > float(thr):
+                    return False
+                if op in ("ge", "gt") and float(val) < float(thr):
+                    return False
+            return True
+
         def random_playbook():
             actions = []
             all_acts = action_space.all_atomic_actions()
+
+            # Bias towards actions that satisfy OTM constraints
+            if constraint_hints:
+                compliant = [a for a in all_acts if _action_matches_constraints(a)]
+                pool = compliant if compliant else all_acts
+            else:
+                pool = all_acts
+
             tries = 0
             # VARIABLE LENGTH: Randomly choose 1 to K actions (e.g., 1-3)
             # This avoids "weird" consistent 3-command blocks
             target_k = random.randint(1, K)
-            
+
             while len(actions) < target_k and tries < 50:
-                a = random.choice(all_acts)
+                a = random.choice(pool)
                 if violates_cooldown(a, cooldown_clock):
                     tries += 1; continue
                 if any(conflict(a, b) for b in actions):
                     tries += 1; continue
                 actions.append(a)
-            
+
             # No padding with NOOPs - we want concise playbooks
             return Playbook(actions)
 

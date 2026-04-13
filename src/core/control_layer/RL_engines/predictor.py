@@ -98,50 +98,45 @@ class SlateDQNPredictor:
         return v
 
     def _encode_action_np(self, a: ControlAction) -> np.ndarray:
-        type_map = {"SCHEDULER_POLICY":0, "MCS_CAP":1, "PRB_WEIGHT":2, "TX_POWER":3, "REPORTING":4}
-        scope_map = {"CELL":0, "UE":1, "SLICE":2}
-        
-        vecs = []
-        vecs.append(self._one_hot(type_map.get(a.type, 4), 5))
-        vecs.append(self._one_hot(scope_map.get(a.scope, 0), 3))
+        type_map = {"MCS_CAP":0, "TX_POWER":1, "REPORTING":2}
+        scope_map = {"CELL":0}
 
-        n_cells = len(self.cell_index) if len(self.cell_index) > 0 else 2
-        n_slices = len(self.slice_index) if len(self.slice_index) > 0 else 2
+        vecs = []
+        vecs.append(self._one_hot(type_map.get(a.type, 2), 3))
+        vecs.append(self._one_hot(scope_map.get(a.scope, 0), 1))
+
+        # Use the model's expected dimensions, not the runtime index size.
+        # This keeps the one-hot positions aligned after loading checkpoints
+        # with different cell/slice counts.
+        n_cells = self.model.action_enc.cell_cap
+        n_slices = self.model.action_enc.slice_cap
         
         vecs.append(self._one_hot(self.cell_index.get(a.cell_id, -1), n_cells))
         vecs.append(self._one_hot(self.slice_index.get(a.slice_id, -1), n_slices))
         
         p = np.zeros(8, dtype=np.float32)
         
-        if a.type == "SCHEDULER_POLICY":
-            pol = a.params.get("policy", "PF")
-            pol_map = {"PF":0, "RR":1, "MAX_THROUGHPUT":2, "WEIGHTED_FAIR":3, "QOS_AWARE":4}
-            p[pol_map.get(pol, 0)] = 1.0
-            
-        elif a.type == "MCS_CAP":
+        if a.type == "MCS_CAP":
             v = float(a.params.get("dl_mcs_max", 28))
             p[0] = min(max(v / 28.0, 0.0), 1.0)
-            
-        elif a.type == "PRB_WEIGHT":
-            w = float(a.params.get("weight", 1.0))
-            p[1] = min(max((w - 0.5) / 1.5, 0.0), 1.0)
-            
+
         elif a.type in ["TX_POWER", "POWER_CONTROL"]:
             tx = float(a.params.get("txPowerDbm", a.params.get("tx_power_dbm", 40.0)))
-            p[2] = min(max((tx - 30.0) / 30.0, 0.0), 1.0)
-            
+            p[1] = min(max((tx - 30.0) / 30.0, 0.0), 1.0)
+
         else:
             p[-1] = 1.0 # NOOP indicator
             
         vecs.append(p)
         
         encoded = np.concatenate(vecs, axis=0)
-        
-        if len(encoded) < 20:
-            encoded = np.pad(encoded, (0, 20 - len(encoded)), 'constant')
-        elif len(encoded) > 20:
-            encoded = encoded[:20]
-            
+
+        D = self.action_onehot_dim
+        if len(encoded) < D:
+            encoded = np.pad(encoded, (0, D - len(encoded)), 'constant')
+        elif len(encoded) > D:
+            encoded = encoded[:D]
+
         return encoded
 
 
@@ -302,7 +297,7 @@ class SlateDQNPredictor:
                          float(r), s2.astype(np.float32), bool(done))
         
     def load_offline(self, path="models/qnet_offline.pt"):
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
         meta = ckpt.get("meta", {})
         cell_cap = meta.get("cell_cap", len(self.cell_index))
         slice_cap = meta.get("slice_cap", len(self.slice_index))
@@ -349,8 +344,8 @@ class SlateDQNPredictor:
         import os
         if not os.path.exists(path):
             return False
-        
-        ckpt = torch.load(path, map_location="cpu")
+
+        ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
         meta = ckpt.get("meta", {})
         
         # Verify dimensions match

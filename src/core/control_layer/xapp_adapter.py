@@ -219,37 +219,6 @@ class XAppKPIAdapter:
         return internal_kpi
 
 
-class OTMToCommandConverter:
-    """
-    Directly converts the declarative OTM structure into xApp-specific 
-    control commands, currently hardcoded using the 'kpi' and 'threshold' fields. 
-    """
-    @staticmethod
-    def convert(otm: Dict[str, Any], meid: str, default_node_id: int = 2) -> List[Dict[str, Any]]:
-        commands = []
-        constraints = otm.get("constraints", [])
-        
-        for constraint in constraints:
-            kpi_id = constraint.get("kpi")
-            val = constraint.get("threshold")
-            
-            cmd_body = None
-            if kpi_id == "dl_mcs_max":
-                cmd_body = {"cmd": "set-mcs", "node": default_node_id, "mcs": int(val)}
-            elif kpi_id == "tx_power_dbm":
-                cmd_body = {"cmd": "set-enb-txpower", "node": default_node_id, "txPowerDbm": float(val)}
-            elif kpi_id == "prb_weight":
-                cmd_body = {"cmd": "set-bandwidth", "node": default_node_id, "bandwidth": int(100 * val)}
-            
-            if cmd_body:
-                commands.append({
-                    "type": "control",
-                    "meid": meid,
-                    "cmd": cmd_body
-                })
-        return commands
-
-
 class XAppTCPServer:
     """TCP server for xApp communication that publishes to membus."""
     
@@ -270,8 +239,8 @@ class XAppTCPServer:
         self.client_node_map: Dict[str, int] = {}  # client_id -> default node_id
         # CSV logging - default to project root directory
         if kpi_csv_file is None:
-            # Find project root (go up from src/demo/ain/RL_demo to project root)
-            project_root = THIS_DIR.parent.parent.parent.parent
+            # control_layer -> core -> src -> hybridAI-nextG (project root)
+            project_root = THIS_DIR.parent.parent.parent
             self.kpi_csv_file = project_root / "kpms.csv"
         else:
             self.kpi_csv_file = Path(kpi_csv_file)
@@ -505,6 +474,33 @@ class XAppTCPServer:
                                 if kpi_data.get("measurements"):
                                     logger.info(f"  First measurement: {kpi_data['measurements'][0]}")
                             self._kpi_debug_logged.add(client_id)
+
+                        # Warn if critical metrics are missing from E2 reports
+                        if not hasattr(self, '_missing_metric_warned'):
+                            self._missing_metric_warned = False
+                        if not self._missing_metric_warned:
+                            measurements = kpi_data.get("measurements", [])
+                            # Collect measurement names (not dict keys — the "name" field values)
+                            all_metric_names = set(kpi_data.keys())
+                            for m in measurements:
+                                if "name" in m:
+                                    all_metric_names.add(m["name"])
+                            for ue_data in kpi_data.get("ues", []):
+                                all_metric_names.update(ue_data.keys())
+                                for um in ue_data.get("measurements", []):
+                                    if "name" in um:
+                                        all_metric_names.add(um["name"])
+                            expected = ["UE_PDCP_Delay_DL_ms", "DRB_PdcpSduDelayDl", "DRB.PdcpSduDelayDl", "DRB.PdcpSduDelayDl.UEID"]
+                            has_latency = any(k in all_metric_names for k in expected)
+                            if not has_latency:
+                                logger.warning("=" * 60)
+                                logger.warning("[XAPP] CRITICAL: No latency metric found in E2 reports!")
+                                logger.warning("[XAPP] Missing: UE_PDCP_Delay_DL_ms / DRB_PdcpSduDelayDl")
+                                logger.warning("[XAPP] MiniRocket anomaly detection will NOT work.")
+                                logger.warning("[XAPP] Check: does the ns-3 scenario call mmw->EnableTraces()?")
+                                logger.warning("=" * 60)
+                                self._missing_metric_warned = True
+
                         cell_id_raw = kpi_data.get("cellObjectID") or kpi_data.get("cell_id") or "unknown"
                         
                         # Normalize cell_id: convert numeric strings to CELL_XXX format
@@ -680,23 +676,28 @@ class XAppTCPServer:
         
         while True:
             msg = await q_cmd.get()
-            cmd_body = msg.payload
+            payload = msg.payload
             
             if not self.clients:
                 logger.warning("[XAPP SERVER] Received command, but no xApp clients are connected!")
                 continue
                 
             client_id = list(self.clients.keys())[0]
-            meid = self.meid_map.get(client_id, "unknown")
             
-            full_command = {
-                "type": "control",
-                "meid": meid,
-                "cmd": cmd_body
-            }
+            # FIX: Prevent double-wrapping! If it already has a "type", pass it directly.
+            if isinstance(payload, dict) and "type" in payload:
+                full_command = payload
+            else:
+                # Fallback for raw commands
+                meid = self.meid_map.get(client_id, "unknown")
+                full_command = {
+                    "type": "control",
+                    "meid": meid,
+                    "cmd": payload
+                }
             
             await self.send_command(client_id, full_command)
-            
+                
     async def send_command(self, client_id: str, command: Dict[str, Any]) -> bool:
         """Send a control command to a client."""
         if not self.commands_enabled:

@@ -15,11 +15,10 @@ class MemBus:
 
     async def init_xapp_server(self, host: str = "0.0.0.0", port: int = 5000):
         """Initialize TCP server for xApp communication."""
-        # BUGFIX: The file xapp_server.py does not exist in bus/. It is in control_layer.
         from core.control_layer.xapp_adapter import XAppTCPServer
         
         self.xapp_server = XAppTCPServer(host, port)
-        self.xapp_server.set_bus(self)  # Give server access to bus
+        self.xapp_server.set_bus(self)
         
         # Register any custom handlers if needed
         self.xapp_server.register_handler("custom_message", self._handle_custom_message)

@@ -19,6 +19,7 @@ cd "$PROJECT_ROOT"
 PYTHON_BIN="/opt/rocm_sdk_612/bin/python3"
 
 # Default values
+MODE="${MODE:-deploy}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-6000}"
 WEB_PORT="${WEB_PORT:-8080}"
@@ -27,6 +28,7 @@ LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
 # Base arguments
 ARGS=(
+    "--mode" "$MODE"
     "--host" "$HOST"
     "--port" "$PORT"
     "--web-port" "$WEB_PORT"
@@ -43,17 +45,21 @@ if [ -f "models/minirocket_xapp_ue.joblib" ]; then
     ARGS+=("--minirocket-ue-model" "models/minirocket_xapp_ue.joblib")
 fi
 
-# Add DQN model if it exists
-if [ -f "models/qnet_offline.pt" ]; then
+# Add DQN model: prefer online (latest trained), fall back to offline.
+if [ -f "models/qnet_online.pt" ]; then
+    ARGS+=("--dqn-model" "models/qnet_online.pt")
+    echo "DQN Model     : models/qnet_online.pt"
+elif [ -f "models/qnet_offline.pt" ]; then
     ARGS+=("--dqn-model" "models/qnet_offline.pt")
-    echo "DQN Model     : models/qnet_offline.pt"
+    echo "DQN Model     : models/qnet_offline.pt (fallback)"
 else
-    echo "DQN Model     : Not found. Optimizer will run untrained."
+    echo "DQN Model     : Not found. Starting untrained."
 fi
 
 echo "=========================================="
 echo "Starting AI system on AMD ROCm Environment"
 echo "=========================================="
+echo "Mode          : $MODE"
 echo "xApp TCP Host : $HOST"
 echo "xApp TCP Port : $PORT"
 echo "Web UI Port   : $WEB_PORT"
@@ -61,4 +67,4 @@ echo "Target Metric : $TARGET_METRIC"
 echo "Log Level     : $LOG_LEVEL"
 echo "=========================================="
 
-$PYTHON_BIN src/core/main.py "${ARGS[@]}"
+exec $PYTHON_BIN src/core/main.py "${ARGS[@]}"
