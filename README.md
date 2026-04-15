@@ -24,38 +24,48 @@ Hybrid AI system for autonomous 5G/6G network optimization. Combines a Deep Rein
 
 ## Usage
 
+Install dependencies:
+
+```bash
+poetry install --no-root
+```
+
 Deploy with the default mode (`deploy`):
 
 ```bash
-./src/core/deploy.sh
+poetry run python src/core/main.py --mode deploy
 ```
 
-Train the DQN agent:
-(This requires the seperate ns3 simulator to run in parallell)
+Train the DQN agent (requires the separate ns-3 simulator running in parallel):
 
 ```bash
-MODE=train ./src/core/deploy.sh
+poetry run python src/core/main.py --mode train
 ```
 
 Run a baseline measurement (no AI actions):
 
 ```bash
-MODE=baseline ./src/core/deploy.sh
+poetry run python src/core/main.py --mode baseline
 ```
 
 Evaluate a trained model against a fixed OTM:
 
 ```bash
-MODE=eval ./src/core/deploy.sh
+poetry run python src/core/main.py --mode eval
 ```
 
 Custom host/port and log level:
 
 ```bash
-MODE=deploy PORT=7000 WEB_PORT=9090 LOG_LEVEL=DEBUG ./src/core/deploy.sh
+poetry run python src/core/main.py --mode deploy --port 7000 --web-port 9090 --log-level DEBUG
 ```
 
-The `deploy_amd.sh` was made specifically for Dino's hardware setup
+Alternatively, use the deploy script which auto-detects models and sets defaults:
+
+```bash
+./src/core/deploy.sh                    # deploy mode
+MODE=train ./src/core/deploy.sh         # train mode
+```
 
 ### Environment Variables
 

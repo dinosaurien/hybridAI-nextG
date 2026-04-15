@@ -9,7 +9,7 @@ packages = [{ include = "core", from = "src" }]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
-numpy = ">=2.3.3,<3.0.0"
+numpy = ">=2.3.3,<2.4"
 pandas = ">=2.3.2,<3.0.0"
 scikit-learn = ">=1.7.2,<2.0.0"
 sktime = ">=0.38,<0.39"
@@ -23,6 +23,8 @@ websockets = "^15.0.1"
 aiohttp = "^3.13.2"
 rdflib = "^7.6.0"
 torch = "^2.10.0"
+huggingface-hub = "^1.10.2"
+llama-cpp-python = "^0.3.20"
 
 [tool.poetry.scripts]
 train_minirocket = "core.train_minirocket:main"

@@ -33,17 +33,20 @@ class CognitiveAgent:
 
         try:
             logger.info("[INIT] Downloading Qwen3.5-9B GGUF (8-bit Quantized)...")
-            
-            model_path = hf_hub_download(
+
+            print("[INIT] Checking/Downloading LLM weights...")
+            self.model_path = hf_hub_download(
                 repo_id="unsloth/Qwen3.5-9B-GGUF", 
-                filename="Qwen3.5-9B-Q8_0.gguf"
+                filename="Qwen3.5-9B-Q8_0.gguf",
+                local_dir="models",
             )
 
             logger.info(f"[INIT] Loading 8-bit GGUF into 6800 XT VRAM via llama.cpp...")
             self.model = Llama(
-                model_path=model_path,
+                model_path=self.model_path,
                 n_gpu_layers=-1, 
-                n_ctx=4096,      
+                n_ctx=4096,
+                use_mmap=False, # Edit this later, this is for my gpu at home
                 verbose=False    
             )
             
@@ -56,17 +59,23 @@ class CognitiveAgent:
             return {}
             
         system_prompt = (
-            "You are a 5G Network AI. Output ONLY valid JSON. No markdown, no explanations.\n"
-            "UNIT RULES (NEVER violate these):\n"
-            "OBSERVABLE METRICS (use in objective or constraints):\n"
-            "- Latency/Delay (DRB_PdcpSduDelayDl, UE_DRB_PdcpSduDelayDl_UEID): unit is ms, typical range 5-200. Example threshold: 50.0\n"
-            "- Throughput (UE_DRB_UEThpDl_UEID): unit is bps, typical range 1000000-500000000. Example threshold: 50000000.0\n"
-            "- BLER (UE_DRB_BlerDl_UEID): unitless ratio, range 0.0-1.0. Example threshold: 0.01\n"
-            "- PRB utilization (RRU_PrbUsedDl): percentage, range 0-100. Example threshold: 80.0\n"
-            "ACTUATED PARAMETERS (use in constraints to guide the RL agent):\n"
-            "- MCS cap (dl_mcs_max): integer index, range 0-28. Example threshold: 20\n"
-            "- TX power (tx_power_dbm): unit is dBm, range 30-60. Example threshold: 46.0\n"
-            "NEVER use throughput-scale numbers (millions) for latency thresholds or vice versa."
+            "You are a strict 5G Network AI. Output ONLY valid JSON. No markdown, no explanations.\n"
+            "CRITICAL RULES (NEVER violate these):\n"
+            "1. OBSERVABLES vs ACTUATORS: You may ONLY adjust 'Actuated Parameters' to fix the network. NEVER relax the targets of 'Observable Metrics' to hide a failure.\n"
+            "2. RF PHYSICS HEURISTICS:\n"
+            "   - High Latency / Congestion -> LOWER the MCS cap (more robust signal) and INCREASE Tx Power.\n"
+            "   - High Interference / BLER -> LOWER the MCS cap and INCREASE Tx Power.\n"
+            "   - Low Throughput (No congestion) -> RAISE the MCS cap.\n"
+            "OBSERVABLE METRICS (Use in objective. Unit rules):\n"
+            "- Latency/Delay (DRB_PdcpSduDelayDl, UE_DRB_PdcpSduDelayDl_UEID): ms (e.g., 50.0)\n"
+            "- Throughput (UE_DRB_UEThpDl_UEID): bps (e.g., 50000000.0)\n"
+            "- BLER (UE_DRB_BlerDl_UEID): ratio (e.g., 0.01)\n"
+            "ACTUATED PARAMETERS (Use in constraints):\n"
+            "- MCS cap (dl_mcs_max): integer index, range 0-28.\n"
+            "- TX power (tx_power_dbm): unit is dBm, range 30-60.\n"
+            "CONSTRAINT SCHEMA: When adding or adjusting constraints, you MUST use this exact JSON object structure:\n"
+            '{"service": "mbb", "kpi": "<PARAMETER_NAME>", "operator": "<le or ge>", "threshold": <FLOAT>, "unit": "<UNIT>", "id": "<UNIQUE_ID>"}\n'
+            'Example: {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge", "threshold": 48.0, "unit": "dBm", "id": "C_TX"}\n'
         )
         
         # llama.cpp has built-in chat templating
@@ -259,9 +268,10 @@ class CognitiveAgent:
                     f"NETWORK ANOMALY: The metric '{metric}' has degraded to a value of {val}.\n"
                     f"KNOWLEDGE BASE PROCEDURES: {rec_str}\n\n"
                     f"TASK:\n"
-                    f"1. Generate a strict OTM JSON to fix this issue using the procedures.\n"
-                    f"2. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in bps (e.g., 50000000.0). DO NOT mix up these numbers!\n"
-                    f"3. Keep the 'adaptation_log' extremely brief (max 1 sentence).\n\n"
+                    f"1. Generate a strict OTM JSON to address this anomaly based on the provided procedures.\n"
+                    f"2. Populate the 'objective' field. WARNING: Latency/Delay is measured in ms. Throughput is measured in bps. DO NOT mix up these numbers!\n"
+                    f"3. MUST DO: Leave the 'constraints' array EMPTY ([]). The orchestration engine will populate the constraints later.\n"
+                    f"4. Keep the 'adaptation_log' extremely brief (max 1 sentence).\n\n"
                     f"STRICT SCHEMA TO FOLLOW:\n{OTM_SCHEMA_TEMPLATE}"
                 )
 
@@ -285,10 +295,11 @@ class CognitiveAgent:
                     f"KNOWLEDGE BASE (RDF Semantic Grounding):\n{rdf_context}\n\n"
                     f"{schedule_block}"
                     f"TASK:\n"
-                    f"1. Read the Knowledge Base. Match the user's request to the most conceptually relevant SCENARIO.\n"
-                    f"2. Use the 'OTM_INSTRUCTION' text from that Scenario to build the 'objective' and 'constraints' in your JSON.\n"
-                    f"3. Set 'procedure_id' in the JSON metadata to the exact 'Mapped procedure_id' of that Scenario.\n"
-                    f"4. Keep the 'adaptation_log' brief, motivate your reasoning. One or two sentences should suffice.\n\n"
+                    f"1. Match the user's request to the most conceptually relevant SCENARIO in the Knowledge Base.\n"
+                    f"2. Use the 'OTM_INSTRUCTION' text from that Scenario to build the 'objective'.\n"
+                    f"3. MUST DO: Leave the 'constraints' array EMPTY ([]). The orchestration engine will populate the constraints later.\n"
+                    f"4. Set 'procedure_id' in the JSON metadata to the exact 'Mapped procedure_id' of that Scenario.\n"
+                    f"5. Keep the 'adaptation_log' brief, motivate your reasoning. One or two sentences should suffice.\n\n"
                     f"STRICT SCHEMA TO FOLLOW:\n{OTM_SCHEMA_TEMPLATE}"
                 )
 
@@ -331,12 +342,14 @@ class CognitiveAgent:
 
                 prompt = (
                     f"ADAPTATION REQUIRED: The network procedure paused because metric '{metric}' failed a health check or is still deviating (current value: {val}).\n"
-                    f"Active OTM Constraints that caused/failed to fix this: {json.dumps(prev_otm.get('constraints', []))}\n\n"
+                    f"Active OTM Constraints: {json.dumps(prev_otm.get('constraints', []))}\n\n"
                     f"TASK:\n"
-                    f"1. Make MARGINAL, incremental relaxations (e.g., adjust a threshold by 10-20%) so the health check barely passes.\n"
-                    f"2. Generate an updated OTM JSON with these slightly relaxed constraints.\n"
-                    f"3. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in bps (e.g., 50000000.0). DO NOT mix up these numbers!\n"
-                    f"4. Keep the 'adaptation_log' EXTREMELY BRIEF (MAXIMUM 1 short sentence summarizing the change). Do NOT write an essay.\n\n"
+                    f"1. Adjust the ACTUATED PARAMETERS (dl_mcs_max, tx_power_dbm) to be slightly more conservative.\n"
+                    f"2. ANTI-REWARD-HACKING: DO NOT alter the thresholds of Observational Metrics (like Latency or Throughput).\n"
+                    f"3. Keep the 'adaptation_log' to exactly 1 short sentence.\n"
+                    f"4. CRITICAL SCHEMA RULE: You MUST format constraints exactly like this example:\n"
+                    f'   {{"service": "mbb", "kpi": "dl_mcs_max", "operator": "le", "threshold": 16.0, "unit": "index", "id": "PROC_MCS"}}\n'
+                    f'   NEVER use the keys "parameter" or "value". Use "kpi", "operator", and "threshold".\n\n'
                     f"STRICT SCHEMA TO FOLLOW:\n{OTM_SCHEMA_TEMPLATE}"
                 )
             
@@ -365,18 +378,22 @@ class CognitiveAgent:
                 anomaly = payload.get("anomaly", {})
                 anomaly_metric = anomaly.get("metric", "unknown")
                 anomaly_value = anomaly.get("value", "unknown")
-                anomaly_target = anomaly.get("target", 40.0)
-                op = "le" if anomaly.get("direction", "lower_better") == "lower_better" else "ge"
+                
+                # Fetch procedures for the new anomaly
+                kb_recommendations = self.kb.query_scenario(anomaly_metric)
+                rec_str = json.dumps(kb_recommendations) if kb_recommendations else "None."
 
                 prompt = (
                     f"MERGE REQUEST: A network anomaly has occurred on '{anomaly_metric}' "
                     f"(current value: {anomaly_value}) while the following OTM is active:\n"
                     f"{json.dumps(active_otm)}\n\n"
-                    f"TASK: Generate a MERGED OTM JSON that:\n"
-                    f"1. PRESERVES the original objective and ALL existing constraints from the active OTM above.\n"
-                    f"2. ADDS a new constraint: '{anomaly_metric}' {op} {anomaly_target}.\n"
-                    f"3. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in bps (e.g., 50000000.0). DO NOT mix up these numbers!\n"
-                    f"4. Keep the 'adaptation_log' brief, motivate your reasoning. One or two sentences should suffice.\n"
+                    f"KNOWLEDGE BASE PROCEDURES FOR NEW ANOMALY: {rec_str}\n\n"
+                    f"TASK: Generate a MERGED OTM JSON that handles both the active OTM and the new anomaly.\n"
+                    f"1. PRESERVE the original objective and existing actuatable constraints from the active OTM if possible.\n"
+                    f"2. Add NEW actuatable constraints (dl_mcs_max, tx_power_dbm) to address the '{anomaly_metric}' anomaly, using the Knowledge Base procedures as a guide.\n"
+                    f"3. Do NOT add observational metrics (like Latency or Throughput) to the constraints array. Only add parameters the system can actuate.\n"
+                    f"4. If new constraints conflict with old ones (e.g., both set an MCS cap), prioritize the MORE CONSERVATIVE constraint (lower MCS, higher TX Power) to ensure stability.\n"
+                    f"5. Keep the 'adaptation_log' brief, motivate your reasoning. One or two sentences should suffice.\n"
                     f"STRICT SCHEMA TO FOLLOW:\n{OTM_SCHEMA_TEMPLATE}"
                 )
 
@@ -431,6 +448,9 @@ class CognitiveAgent:
                     prev_log = payload.get("active_otm", {}).get("metadata", {}).get("adaptation_log", [])
 
                 current_log = otm_json["metadata"].get("adaptation_log", [])
+                # LLM sometimes returns a string instead of a list — normalize it
+                if isinstance(current_log, str):
+                    current_log = [current_log] if current_log.strip() else []
                 merged_log = list(prev_log)
                 for entry in current_log:
                     if entry not in merged_log:

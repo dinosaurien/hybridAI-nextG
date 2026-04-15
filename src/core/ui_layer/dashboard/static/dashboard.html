@@ -246,8 +246,7 @@
                 this.scheduleQueue = [];
                 this.maxHistoryItems = 50;
                 
-                this.ueStats = {};       
-                this.displayCache = {};  
+                this.displayCache = {};
 
                 // DOM Mappings
                 this.statusDot = document.getElementById('statusDot');
@@ -335,14 +334,7 @@
                     }
 
                     if (currentRawThp !== undefined) {
-                        if (this.ueStats[ueId] !== undefined) {
-                            let deltaBytes = currentRawThp - this.ueStats[ueId];
-                            if (deltaBytes > 0) {
-                                let trueThpMbps = (deltaBytes * 80) / 1e6;
-                                this.displayCache[ueId].throughput = trueThpMbps.toFixed(2);
-                            }
-                        }
-                        this.ueStats[ueId] = currentRawThp;
+                        this.displayCache[ueId].throughput = (currentRawThp / 1e6).toFixed(2);
                     }
 
                     return `

@@ -70,3 +70,25 @@ echo "=========================================="
 # RUN THE CORE SYSTEM USING POETRY
 # exec ensures the python process takes over the shell
 exec poetry run python src/core/main.py "${ARGS[@]}"
+
+
+
+# NOTE:
+# For amd 6800xt card:
+# If only poetry install LLAMA with the above logic you get cpu-only version
+
+# Run the code below for amd support, ensure locations for rocm etc are correct, also check gpu target:
+
+'''
+poetry env use /opt/rocm_sdk_612/bin/python3
+poetry run pip install scikit-build-core cmake ninja
+
+export ROCM_PATH=/opt/rocm_sdk_612
+export CMAKE_PREFIX_PATH=$ROCM_PATH
+export GGML_HIPBLAS=ON
+export AMDGPU_TARGETS=gfx1030
+
+CMAKE_ARGS="-DGGML_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1030" \
+FORCE_CMAKE=1 \
+poetry run pip install --force-reinstall llama-cpp-python "numpy<2.4" --no-cache-dir --no-build-isolation
+'''

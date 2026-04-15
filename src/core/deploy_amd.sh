@@ -3,6 +3,9 @@
 # This is used for Dino's (personal) custom amd rocm python environment. 
 # For standard environments, use deploy.sh together with Poetry (standard Nvidia cuda/torch dependencies).
 
+# For Dino, this command must be inserted first: export LD_LIBRARY_PATH="/opt/rocm_sdk_612/lib:/opt/rocm_sdk_612/lib64:/opt/rocm_sdk_612/rocm_smi/lib:$LD_LIBRARY_PATH"
+
+
 set -e
 
 # AMD ROCm CONFIGURATION
