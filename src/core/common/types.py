@@ -7,55 +7,6 @@ import uuid as _uuid
 
 _logger = logging.getLogger(__name__)
 
-# Maps semantic names the LLM may produce -> (csv_metric, direction, default_target)
-# This is the single source of truth used by observer_rl, observer_agent, and proposer.
-_OTM_METRIC_TABLE: Dict[str, Tuple[str, str, float]] = {
-    # latency family
-    "latency":                   ("DRB_PdcpSduDelayDl",      "lower_better",  40.0),
-    "delay":                     ("DRB_PdcpSduDelayDl",      "lower_better",  40.0),
-    "drb_pdcpsdudelaydl":        ("DRB_PdcpSduDelayDl",      "lower_better",  40.0),
-    "ue_drb_pdcpsdudelaydl_ueid":("UE_DRB_PdcpSduDelayDl_UEID","lower_better",40.0),
-    # throughput family
-    "throughput":                ("UE_DRB_UEThpDl_UEID",     "higher_better", 50_000_000.0),
-    "tpt":                       ("UE_DRB_UEThpDl_UEID",     "higher_better", 50_000_000.0),
-    "thr_dl":                    ("UE_DRB_UEThpDl_UEID",     "higher_better", 50_000_000.0),
-    "ue_drb_uethpdl_ueid":      ("UE_DRB_UEThpDl_UEID",     "higher_better", 50_000_000.0),
-    # power / energy family
-    "power":                     ("tx_power_dbm",            "lower_better",  30.0),
-    "tx_power":                  ("tx_power_dbm",            "lower_better",  30.0),
-    "tx_power_dbm":              ("tx_power_dbm",            "lower_better",  30.0),
-    "energy":                    ("tx_power_dbm",            "lower_better",  30.0),
-    # error rate family
-    "bler":                      ("UE_DRB_BlerDl_UEID",     "lower_better",  0.01),
-    "bler_dl":                   ("UE_DRB_BlerDl_UEID",     "lower_better",  0.01),
-    "ue_drb_blerdl_ueid":       ("UE_DRB_BlerDl_UEID",     "lower_better",  0.01),
-    # PRB / resource family (observational only — prb_weight action not actuated in ns-3)
-    "prb":                       ("RRU_PrbUsedDl",           "lower_better",  50.0),
-    "rru_prbuseddl":             ("RRU_PrbUsedDl",           "lower_better",  50.0),
-    # MCS family
-    "mcs":                       ("dl_mcs_max",              "lower_better",  20.0),
-    "dl_mcs_max":                ("dl_mcs_max",              "lower_better",  20.0),
-}
-
-# Map a semantic or raw KPI name from an OTM to (csv_metric, direction, default_target).
-# Falls back to (name, "lower_better", 40.0) with a warning if unrecognised.
-def map_otm_metric(name: str) -> Tuple[str, str, float]:
-    key = name.strip().lower()
-    # Exact match first
-    if key in _OTM_METRIC_TABLE:
-        return _OTM_METRIC_TABLE[key]
-    # Substring match (e.g. "DRB_PdcpSduDelayDl" contains "delay")
-    for keyword, entry in _OTM_METRIC_TABLE.items():
-        if keyword in key or key in keyword:
-            return entry
-    _logger.warning(f"[METRIC_MAP] Unmapped OTM metric '{name}' — using as-is with lower_better default.")
-    return (name, "lower_better", 40.0)
-
-
-def map_otm_metric_name(name: str) -> str:
-    # returns only the CSV metric name.
-    return map_otm_metric(name)[0]
-
 ActionType = str   # {"SCHEDULER_POLICY","MCS_CAP","PRB_WEIGHT","SLICE_QOS","TX_POWER","POWER_CONTROL","REPORTING"}
 ScopeType = str    # {"CELL","UE","SLICE"}
 

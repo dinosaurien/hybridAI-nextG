@@ -38,7 +38,7 @@ class MemBus:
         for q in list(self._topics.get(topic, [])):
             await q.put(payload)
             
-        if self.xapp_server and topic in ["proposer.candidates", "intent.current", "deviation.detected"]:
+        if self.xapp_server and topic in ["intent.current", "deviation.detected"]:
             notification = {
                 "type": "ai_notification",
                 "topic": topic,

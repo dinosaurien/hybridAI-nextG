@@ -7,8 +7,8 @@ logger = logging.getLogger(__name__)
 
 class NetworkOptimizer:
     """
-    Acts as the bridge between the Cognitive Core (LLM) and the RL Engine.
-    Takes declarative OTMs, formats them for the UI, and pushes them to the RL loop.
+    Acts as the bridge between the Cognitive Core (LLM) and the Constraint Executor.
+    Takes declarative OTMs, formats them for the UI, and pushes them to the execution layer.
     """
     def __init__(self, bus):
         self.bus = bus
@@ -95,7 +95,7 @@ class NetworkOptimizer:
             # without these display-only fields.
             final_payload["raw_otm"] = json.dumps(logical_otm, indent=2)
 
-            logger.info(f"[OPTIMIZER] Forwarding cleaned OTM to RL Engine (Trace: {msg.corr_id})")
-            
-            # Final hop to the RL engine and UI bridge
+            logger.info(f"[OPTIMIZER] Forwarding cleaned OTM to execution layer (Trace: {msg.corr_id})")
+
+            # Final hop to the constraint executor and UI bridge
             await self.bus.pub("intent.current", make_msg("optimizer", "INTENT", "v1", final_payload, corr_id=msg.corr_id))

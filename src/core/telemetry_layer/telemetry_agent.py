@@ -42,7 +42,7 @@ class DeviationMonitor:
         self.minirocket: Optional[MiniRocketRT] = None
         if MINIROCKET_AVAILABLE:
             try:
-                self.minirocket = MiniRocketRT(model_path=model_path, win=window_size)
+                self.minirocket = MiniRocketRT(model_path=model_path, win=window_size, entity_id=self.entity_id)
                 logger.log(LOG_DEVIATION, f"[DEVIATION] Loaded MiniRocket model for {entity_id} on metric {metric}")
             except Exception as e:
                 logger.warning(f"[DEVIATION] Failed to load model for {entity_id}: {e}")

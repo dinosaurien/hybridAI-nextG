@@ -45,16 +45,9 @@ if [ -f "models/minirocket_xapp_ue.joblib" ]; then
     ARGS+=("--minirocket-ue-model" "models/minirocket_xapp_ue.joblib")
 fi
 
-# Add DQN model: prefer online (latest trained), fall back to offline.
-if [ -f "models/qnet_online.pt" ]; then
-    ARGS+=("--dqn-model" "models/qnet_online.pt")
-    echo "DQN Model     : models/qnet_online.pt"
-elif [ -f "models/qnet_offline.pt" ]; then
-    ARGS+=("--dqn-model" "models/qnet_offline.pt")
-    echo "DQN Model     : models/qnet_offline.pt (fallback)"
-else
-    echo "DQN Model     : Not found. Starting untrained."
-fi
+# DQN model removed — this branch uses deterministic constraint execution.
+# The RL pipeline (DQN Proposer/Predictor/Actor) was replaced by the
+# ConstraintExecutor + LLM CognitiveAgent on the llm_planner branch.
 
 echo "=========================================="
 echo "Starting AI system on AMD ROCm Environment"

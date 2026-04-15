@@ -12,28 +12,35 @@ from core.bus.mem import MemBus
 from core.bus.messages import make_msg
 from core.utils.knowledge_base import KnowledgeBase
 from core.common.types import ScheduledIntent, ScheduleState, ActiveProcedure, ProcedureState, ProcedureStep
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
 class IntentState(Enum):
     MONITORING = auto()
     THINKING = auto()
-    ASSURANCE = auto()  # 30s grace period to let RL settle
+    ASSURANCE = auto()  # 30s grace period for constraint executor to apply actions
     WITHDRAWAL = auto() # Evaluate whether the OTM resolved the deviation
+    ESCALATED = auto()  # System frozen after repeated failures — awaiting human intervention
 
 class OrchestratorAgent:
     THINKING_TIMEOUT = 75.0   # seconds before assuming LLM failed
     WITHDRAWAL_WINDOW = 10.0  # seconds to evaluate post-assurance telemetry
+    MAX_ADAPTATION_CYCLES = 5  # cap adaptation loops before declaring failure
+    ESCALATED_TIMEOUT = 300.0  # seconds before auto-unlocking ESCALATED state
+    HEALTH_CHECK_WINDOW = 10.0 # seconds of telemetry data to consider for health check
 
-    def __init__(self, bus: MemBus, kb: KnowledgeBase):
+    def __init__(self, bus: MemBus, kb: KnowledgeBase, episode_store=None):
         self.bus = bus
         self.kb = kb
+        self.episode_store = episode_store
         self.state = IntentState.MONITORING
         self.thinking_start_time = 0.0
         self.assurance_end_time = 0.0
         self.withdrawal_end_time = 0.0
         self.active_otm = None
         self.active_anomaly_metric = None
+        self.triggering_anomaly: Optional[dict] = None  # Full anomaly payload for episode recording
         self.pending_manual_intents = []
         self.e2_acks_received = 0
         self.last_metric_value = None
@@ -41,6 +48,11 @@ class OrchestratorAgent:
         self.active_procedure: Optional[ActiveProcedure] = None
         self.pending_cancel_revert = None  # OTM to revert to after graceful cancel completes
         self.last_kpi_snapshot: dict = {}  # Full latest telemetry for health checks
+        self.kpi_history = deque() # Stores timestamps and snapshots of recent KPIs for health check evaluation
+        self.scenario_failure_count: int = 0  # Consecutive scenario failures (for escalation)
+        self.adaptation_cycle_count: int = 0  # Consecutive adapt_otm cycles for current anomaly
+        self.escalated_at: float = 0.0  # Timestamp when ESCALATED was entered
+        self.escalated_anomaly_queue: list = []  # Anomalies received while ESCALATED
 
         # Evaluation event log, append-only JSONL for later analysis of orchestration logic
         self._event_log_path = Path("models/orchestrator_events.jsonl")
@@ -82,7 +94,16 @@ class OrchestratorAgent:
             while not q_kpi.empty():
                 kpi_msg = q_kpi.get_nowait()
                 raw = kpi_msg.payload.get("kpi", kpi_msg.payload)
-                self.last_kpi_snapshot = raw  # Full snapshot for health checks
+                
+                self.last_kpi_snapshot = raw  # Keep for backwards compatibility
+                
+                # Append to rolling history and prune
+                now = time.time()
+                self.kpi_history.append((now, raw))
+                
+                while self.kpi_history and now - self.kpi_history[0][0] > self.HEALTH_CHECK_WINDOW:
+                    self.kpi_history.popleft()
+                
                 if self.active_anomaly_metric:
                     cell = raw.get("CellMetrics", {})
                     val = cell.get(self.active_anomaly_metric)
@@ -92,6 +113,13 @@ class OrchestratorAgent:
             # Timeout: if LLM hasn't responded, unlock the loop
             if self.state == IntentState.THINKING and current_time >= self.thinking_start_time + self.THINKING_TIMEOUT:
                 logger.warning("[ORCHESTRATOR] THINKING timeout reached — Cognitive Core did not respond. Returning to MONITORING.")
+                self.state = IntentState.MONITORING
+
+            # ESCALATED auto-unlock: don't stay frozen forever if no human intervenes
+            if self.state == IntentState.ESCALATED and current_time >= self.escalated_at + self.ESCALATED_TIMEOUT:
+                logger.warning(f"[ORCHESTRATOR] ESCALATED timeout ({self.ESCALATED_TIMEOUT}s) reached. "
+                               "Auto-unlocking to MONITORING. Safe-mode OTM remains active.")
+                self._log_event("escalated_timeout")
                 self.state = IntentState.MONITORING
 
             # ASSURANCE -> WITHDRAWAL transition
@@ -108,39 +136,63 @@ class OrchestratorAgent:
 
             # WITHDRAWAL evaluation
             if self.state == IntentState.WITHDRAWAL and current_time >= self.withdrawal_end_time:
-                resolved = self._evaluate_withdrawal()
+                resolved = await self._evaluate_withdrawal()
                 if resolved:
+                    self.adaptation_cycle_count = 0  # Reset on success
                     # If a procedure is active, advance to the next step instead of MONITORING
                     if self.active_procedure and self.active_procedure.state == ProcedureState.ACTIVE:
                         self.active_procedure.step_failures = 0
                         advanced = await self._advance_procedure()
                         if not advanced:
-                            # No more steps, procedure is complete
+                            # No more steps — procedure complete. Record final episode.
+                            await self._record_and_reflect(resolved=True)
                             await self._complete_procedure()
+                            self._clear_anomaly_state()
                             self.state = IntentState.MONITORING
-                        # else: _advance_procedure already set state to ASSURANCE
+                        # else: intermediate step — _advance_procedure set state to ASSURANCE, no episode yet
                     else:
+                        # No procedure — simple anomaly→OTM→resolved cycle. Record episode.
+                        await self._record_and_reflect(resolved=True)
                         logger.info("[ORCHESTRATOR] WITHDRAWAL: Deviation resolved. Returning to MONITORING.")
+                        self._clear_anomaly_state()
                         self.state = IntentState.MONITORING
                 else:
                     # Check procedure step failure limit
                     if self.active_procedure and self.active_procedure.state == ProcedureState.ACTIVE:
                         self.active_procedure.step_failures += 1
                         if self.active_procedure.step_failures >= 3:
+                            # Procedure exhausted — record failed episode before rollback
+                            await self._record_and_reflect(resolved=False)
                             logger.warning(f"[ORCHESTRATOR] Procedure step failed 3 times. Rolling back procedure.")
                             await self._rollback_procedure()
                             continue
 
-                    logger.warning("[ORCHESTRATOR] WITHDRAWAL: Deviation persists. Re-engaging Cognitive Core for adaptation.")
-                    self.state = IntentState.THINKING
-                    self.thinking_start_time = current_time
-                    self.e2_acks_received = 0
-                    metric = self.active_anomaly_metric
-                    await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
-                        "type": "adapt_otm", "metric": metric,
-                        "value": self.last_metric_value,
-                        "previous_otm": self.active_otm
-                    }))
+                    # Adaptation loop — don't record episode yet, wait for eventual resolution
+                    self.adaptation_cycle_count += 1
+
+                    if self.adaptation_cycle_count >= self.MAX_ADAPTATION_CYCLES:
+                        # Adaptation exhausted — record failed episode, return to MONITORING
+                        logger.warning(f"[ORCHESTRATOR] Adaptation limit reached ({self.MAX_ADAPTATION_CYCLES} cycles). "
+                                       "Recording failure and returning to MONITORING.")
+                        self._log_event("adaptation_exhausted",
+                                        metric=self.active_anomaly_metric,
+                                        cycles=self.adaptation_cycle_count)
+                        await self._record_and_reflect(resolved=False)
+                        self.adaptation_cycle_count = 0
+                        self._clear_anomaly_state()
+                        self.state = IntentState.MONITORING
+                    else:
+                        logger.warning(f"[ORCHESTRATOR] WITHDRAWAL: Deviation persists (cycle {self.adaptation_cycle_count}/{self.MAX_ADAPTATION_CYCLES}). "
+                                       "Re-engaging Cognitive Core for adaptation.")
+                        self.state = IntentState.THINKING
+                        self.thinking_start_time = current_time
+                        self.e2_acks_received = 0
+                        metric = self.active_anomaly_metric
+                        await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
+                            "type": "adapt_otm", "metric": metric,
+                            "value": self.last_metric_value,
+                            "previous_otm": self.active_otm
+                        }))
 
             # Graceful cancel revert: apply when system settles back to MONITORING
             if self.state == IntentState.MONITORING and self.pending_cancel_revert is not None:
@@ -162,7 +214,10 @@ class OrchestratorAgent:
                         logger.info(f"[ORCHESTRATOR] Procedure '{self.active_procedure.scenario_name}' active. "
                                     f"Queuing manual intent: '{text}'")
                         self.pending_manual_intents.append(text)
-                    elif self.state in (IntentState.MONITORING, IntentState.ASSURANCE, IntentState.WITHDRAWAL):
+                    elif self.state in (IntentState.MONITORING, IntentState.ASSURANCE, IntentState.WITHDRAWAL, IntentState.ESCALATED):
+                        if self.state == IntentState.ESCALATED:
+                            logger.info("[ORCHESTRATOR] Human override received — unlocking ESCALATED state.")
+                            self.scenario_failure_count = 0
                         self.state = IntentState.THINKING
                         self.thinking_start_time = current_time
                         self.e2_acks_received = 0
@@ -202,6 +257,7 @@ class OrchestratorAgent:
 
                 if self.state == IntentState.MONITORING:
                     logger.info(f"[ORCHESTRATOR] Anomaly Detected: {metric} (state: {self.state.name}).")
+                    self.triggering_anomaly = dev  # Snapshot for episode recording
                     self._log_event("anomaly_detected",
                                     metric=metric, value=dev.get('value'),
                                     severity=dev.get('severity', 'unknown'))
@@ -239,8 +295,31 @@ class OrchestratorAgent:
                         }, corr_id=msg.corr_id))
                     self.active_anomaly_metric = metric
                     break
+                elif self.state == IntentState.ESCALATED:
+                    # Queue anomalies during ESCALATED so they can be processed after unlock
+                    if len(self.escalated_anomaly_queue) < 5:  # Cap to prevent OOM
+                        self.escalated_anomaly_queue.append(dev)
+                    logger.info(f"[ORCHESTRATOR] ESCALATED: queued anomaly on {metric} "
+                                f"({len(self.escalated_anomaly_queue)} queued)")
                 else:
                     logger.debug(f"[ORCHESTRATOR] Busy ({self.state.name}). Ignoring anomaly on {metric}")
+
+            # When returning to MONITORING from ESCALATED, process the most recent queued anomaly
+            if self.state == IntentState.MONITORING and self.escalated_anomaly_queue:
+                latest = self.escalated_anomaly_queue[-1]
+                self.escalated_anomaly_queue.clear()
+                metric = latest['metric']
+                logger.info(f"[ORCHESTRATOR] Processing queued anomaly from ESCALATED: {metric}")
+                self.triggering_anomaly = latest
+                self._log_event("anomaly_detected", metric=metric,
+                                value=latest.get('value'), severity=latest.get('severity', 'unknown'))
+                self.state = IntentState.THINKING
+                self.thinking_start_time = time.time()
+                self.e2_acks_received = 0
+                self.active_anomaly_metric = metric
+                await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
+                    "type": "generate_otm", "metric": metric, "value": latest['value']
+                }))
 
             while not q_otm.empty():
                 msg = q_otm.get_nowait()
@@ -279,11 +358,17 @@ class OrchestratorAgent:
 
     #  Helpers
 
+    def _clear_anomaly_state(self):
+        """Reset anomaly tracking fields to prevent stale data from contaminating
+        future episodes or WITHDRAWAL evaluations."""
+        self.active_anomaly_metric = None
+        self.triggering_anomaly = None
+        self.last_metric_value = None
+        self.adaptation_cycle_count = 0
+
     async def _route_manual_intent(self, text: str):
         """Route a manual intent — merge with active OTM if one exists, else fresh."""
-        # Clear stale anomaly metric so WITHDRAWAL evaluates the manual intent's own metric
-        self.active_anomaly_metric = None
-        self.last_metric_value = None
+        self._clear_anomaly_state()
         schedule_ctx = self._get_schedule_context()
         if self.active_otm:
             logger.info(f"[ORCHESTRATOR] Merging manual intent '{text}' with active OTM (manual takes priority).")
@@ -359,11 +444,14 @@ class OrchestratorAgent:
 
         asyncio.create_task(self.bus.pub("intent.execute", make_msg("orch", "NEW_TARGET", "v1", self.active_otm)))
 
-    def _evaluate_withdrawal(self) -> bool:
+    async def _evaluate_withdrawal(self) -> bool:
         """Check whether the anomaly metric has recovered.
 
         Uses the KnowledgeBase health thresholds as the success criteria.
         Returns True if the deviation is resolved, False if it persists.
+
+        Episode recording is handled separately by _record_and_reflect() at
+        cycle boundaries (not every intermediate procedure step).
         """
         if self.last_metric_value is None or self.active_anomaly_metric is None:
             resolved = True
@@ -385,7 +473,77 @@ class OrchestratorAgent:
                         metric=self.active_anomaly_metric,
                         value=self.last_metric_value,
                         e2_acks=self.e2_acks_received)
+
         return resolved
+
+    async def _record_and_reflect(self, resolved: bool):
+        """Record an episode at the end of an anomaly→OTM→outcome cycle and
+        trigger Reflexion self-reflection.
+
+        Only called at cycle boundaries: final resolution, procedure completion,
+        or procedure rollback — NOT at every intermediate WITHDRAWAL step.
+        """
+        if not self.episode_store or not self.triggering_anomaly:
+            return
+
+        try:
+            outcome = {
+                "resolved": resolved,
+                "metric_before": self.triggering_anomaly.get("value"),
+                "metric_after": self.last_metric_value,
+                "e2_acks": self.e2_acks_received,
+            }
+
+            # Build the OTM snapshot for the episode.
+            # Use applied_value (what was actually sent to ns-3) when available,
+            # falling back to threshold. This ensures Reflexion learns from
+            # real outcomes, not the LLM's intended-but-biased thresholds.
+            constraints_with_applied = []
+            if self.active_otm:
+                for c in self.active_otm.get("constraints", []):
+                    c_copy = dict(c)
+                    if "applied_value" in c_copy:
+                        c_copy["threshold_original"] = c_copy["threshold"]
+                        c_copy["threshold"] = c_copy["applied_value"]
+                    constraints_with_applied.append(c_copy)
+
+            # Pass a modified OTM copy where actuatable constraint thresholds
+            # reflect what was actually applied (not the LLM's raw boundaries).
+            otm_for_recording = self.active_otm
+            if constraints_with_applied and self.active_otm:
+                otm_for_recording = dict(self.active_otm)
+                otm_for_recording["constraints"] = constraints_with_applied
+
+            episode_id = self.episode_store.record(
+                anomaly=self.triggering_anomaly,
+                otm=otm_for_recording,
+                outcome=outcome,
+            )
+
+            # Build reflection payload using applied values
+            reflect_constraints = constraints_with_applied if constraints_with_applied else []
+
+            # Trigger async self-reflection (Reflexion, Shinn et al. 2023).
+            # Published on a separate topic so reflections don't block
+            # urgent OTM generation/adaptation on the ai.request queue.
+            await self.bus.pub("ai.reflect", make_msg(
+                "orchestrator", "REFLECT", "v1", {
+                    "type": "reflect",
+                    "episode_id": episode_id,
+                    "episode": {
+                        "anomaly": self.triggering_anomaly,
+                        "otm_prescribed": {
+                            "objective": self.active_otm.get("objective", {}) if self.active_otm else {},
+                            "constraints": reflect_constraints,
+                            "procedure_id": (self.active_otm or {}).get("metadata", {}).get("procedure_id"),
+                        },
+                        "outcome": outcome,
+                    },
+                }
+            ))
+            logger.info(f"[ORCHESTRATOR] Episode {episode_id[:8]} recorded, reflection requested.")
+        except Exception as e:
+            logger.warning(f"[ORCHESTRATOR] Failed to record episode: {e}")
 
     #  Procedure Queue
     async def _advance_procedure(self) -> bool:
@@ -461,7 +619,7 @@ class OrchestratorAgent:
                             # Construct a safe, deterministic OTM with an Autopsy
                             baseline_otm = {
                                 "version": "1.0",
-                                "objective": {"service": "mbb", "kpi": "latency", "aggregation": "mean", "unit": "ms", "maximize": False},
+                                "objective": {"service": "mbb", "kpi": "DRB_PdcpSduDelayDl", "aggregation": "mean", "unit": "ms", "maximize": False},
                                 "constraints": [
                                     {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le", "threshold": 20.0, "unit": "", "id": "SAFE_MCS"},
                                     {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge", "threshold": 46.0, "unit": "dBm", "id": "SAFE_PWR"}
@@ -483,12 +641,14 @@ class OrchestratorAgent:
                             # Update our active OTM tracker
                             self.active_otm = baseline_otm
                             
-                            # Publish the safe constraints directly to the RL engine
+                            # Publish the safe constraints directly to the execution layer
                             asyncio.create_task(self.bus.pub("intent.execute", make_msg("orch", "NEW_TARGET", "v1", self.active_otm)))
                             
-                            # Lock the system. It will ignore new anomalies until a UI manual intent arrives.
+                            # Lock the system. It will ignore new anomalies until timeout or human intervention.
                             self.state = IntentState.ESCALATED
-                            logger.critical("[ORCHESTRATOR] System locked in ESCALATED state. Awaiting human intervention.")
+                            self.escalated_at = time.time()
+                            logger.critical("[ORCHESTRATOR] System locked in ESCALATED state. "
+                                            f"Auto-unlock in {self.ESCALATED_TIMEOUT}s or via manual intent.")
                             
                             return True
                             
@@ -550,7 +710,7 @@ class OrchestratorAgent:
             self.assurance_end_time = time.time() + 30.0
             self.e2_acks_received = 0
 
-            # Publish updated OTM so RL engine picks up the new constraints
+            # Publish updated OTM so constraint executor picks up the new constraints
             await self.bus.pub("intent.execute", make_msg(
                 "opt", "NEW_TARGET", "v1", self.active_otm))
             await self._publish_procedure_update("step_activated", step)
@@ -574,61 +734,83 @@ class OrchestratorAgent:
                     if ec.get("id") == cid:
                         ec["operator"] = new_c["operator"]
                         ec["threshold"] = new_c["threshold"]
+                        ec["origin"] = "procedure_step"  # Tag for constraint executor
                         break
             else:
-                existing.append(dict(new_c))
+                tagged = dict(new_c)
+                tagged["origin"] = "procedure_step"  # Tag for constraint executor
+                existing.append(tagged)
 
     def _evaluate_health_check(self, step: ProcedureStep) -> tuple:
-        """Evaluate health check conditions against latest telemetry.
+        """Evaluate health check conditions against a 10-second rolling telemetry window.
 
         Returns (passed: bool, details: str).
         """
         checks = step.health_check.get("checks", [])
-        cell = self.last_kpi_snapshot.get("CellMetrics", {})
-        ues = self.last_kpi_snapshot.get("UEMetrics", [])
-
-        # Build UE-metric averages
-        ue_avg: dict = {}
-        if ues:
-            for ue in ues:
-                for k, v in ue.items():
-                    if k in ("ue_id", "cell_id"):
-                        continue
-                    try:
-                        ue_avg.setdefault(k, []).append(float(v))
-                    except (ValueError, TypeError):
-                        pass
-            ue_avg = {k: sum(vs) / len(vs) for k, vs in ue_avg.items()}
+        now = time.time()
+        
+        # Ensure we are only looking at data from the last 10 seconds
+        valid_history = [raw for t, raw in self.kpi_history if now - t <= self.HEALTH_CHECK_WINDOW]
+        
+        if not valid_history:
+            return False, "FAILED: No telemetry data available in the 10-second window."
 
         results = []
         all_passed = True
+        
         for chk in checks:
             metric = chk["metric"]
             op = chk["operator"]
             threshold = float(chk["threshold"])
 
-            val = cell.get(metric)
-            if val is None:
-                val = ue_avg.get(metric)
-            if val is None:
-                results.append(f"{metric}: NO DATA")
-                # No data is not a failure — skip this check
+            # Collect all values for this metric over the 10s window
+            window_values = []
+            
+            for raw in valid_history:
+                cell = raw.get("CellMetrics", {})
+                ues = raw.get("UEMetrics", [])
+                
+                val = cell.get(metric)
+                
+                # If not a cell metric, average across all UEs for this specific timestamp
+                if val is None and ues:
+                    ue_vals = []
+                    for ue in ues:
+                        if metric in ue and ue[metric] is not None:
+                            try:
+                                ue_vals.append(float(ue[metric]))
+                            except (ValueError, TypeError):
+                                pass
+                    if ue_vals:
+                        val = sum(ue_vals) / len(ue_vals)
+                
+                if val is not None:
+                    window_values.append(float(val))
+
+            # --- Evaluation ---
+            if not window_values:
+                # FIX applied here: NO DATA triggers a failure instead of passing
+                results.append(f"{metric}: NO DATA (Connection Dropped?)")
+                all_passed = False
                 continue
 
-            val = float(val)
+            # Calculate the mean over the health check window
+            avg_val = sum(window_values) / len(window_values)
+
             if op == "le":
-                ok = val <= threshold
+                ok = avg_val <= threshold
             elif op == "lt":
-                ok = val < threshold
+                ok = avg_val < threshold
             elif op == "ge":
-                ok = val >= threshold
+                ok = avg_val >= threshold
             elif op == "gt":
-                ok = val > threshold
+                ok = avg_val > threshold
             else:
                 ok = False
 
             status = "OK" if ok else "FAIL"
-            results.append(f"{metric}={val:.2f} {op} {threshold} -> {status}")
+            results.append(f"{metric}={avg_val:.2f}avg (N={len(window_values)}) {op} {threshold} -> {status}")
+            
             if not ok:
                 all_passed = False
 
@@ -819,6 +1001,7 @@ class OrchestratorAgent:
                 continue
 
             logger.info(f"[ORCHESTRATOR] Activating scheduled intent '{si.id[:8]}': {si.raw_text}")
+            self._clear_anomaly_state()  # Prevent stale anomaly data from contaminating episode recording
             # Auto-expire any existing ACTIVE scheduled intent and unwind its OTM
             for other in self.schedule_queue:
                 if other.state == ScheduleState.ACTIVE:
@@ -828,7 +1011,7 @@ class OrchestratorAgent:
             si.pre_intent_otm = self.active_otm  # Now captures the correct baseline
             si.state = ScheduleState.ACTIVE
             self._apply_otm(si.otm)
-            # Republish so RL engine picks up the correct OTM at activation time
+            # Republish so constraint executor picks up the correct OTM at activation time
             await self.bus.pub("intent.execute", make_msg("orch", "SCHEDULE_ACTIVATION", "v1", si.otm))
             schedule_changed = True
             break  # one activation per tick to respect the state machine

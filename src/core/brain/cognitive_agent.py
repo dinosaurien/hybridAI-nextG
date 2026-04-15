@@ -4,6 +4,7 @@ import re
 import uuid
 import datetime
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from core.bus.mem import MemBus
 from core.bus.messages import make_msg
@@ -23,12 +24,14 @@ OTM_SCHEMA_TEMPLATE = """
 """
 
 class CognitiveAgent:
-    MAX_NEW_TOKENS = 4096  # generous headroom — merge/adapt OTMs can produce longer JSON
+    MAX_NEW_TOKENS = 4096
 
-    def __init__(self, bus, kb):
+    def __init__(self, bus, kb, episode_store=None):
         self.bus = bus
         self.kb = kb
+        self.episode_store = episode_store
         self.executor = ThreadPoolExecutor(max_workers=1)
+        self._model_lock = threading.Lock()  # Serialize all Llama model access
         self.model = None
 
         try:
@@ -54,7 +57,11 @@ class CognitiveAgent:
     def _generate(self, prompt: str) -> dict:
         if not self.model:
             return {}
-            
+
+        with self._model_lock:
+            return self._generate_locked(prompt)
+
+    def _generate_locked(self, prompt: str) -> dict:
         system_prompt = (
             "You are a 5G Network AI. Output ONLY valid JSON. No markdown, no explanations.\n"
             "UNIT RULES (NEVER violate these):\n"
@@ -63,9 +70,10 @@ class CognitiveAgent:
             "- Throughput (UE_DRB_UEThpDl_UEID): unit is bps, typical range 1000000-500000000. Example threshold: 50000000.0\n"
             "- BLER (UE_DRB_BlerDl_UEID): unitless ratio, range 0.0-1.0. Example threshold: 0.01\n"
             "- PRB utilization (RRU_PrbUsedDl): percentage, range 0-100. Example threshold: 80.0\n"
-            "ACTUATED PARAMETERS (use in constraints to guide the RL agent):\n"
+            "ACTUATABLE PARAMETERS (include these in constraints — they are applied directly to the network):\n"
             "- MCS cap (dl_mcs_max): integer index, range 0-28. Example threshold: 20\n"
             "- TX power (tx_power_dbm): unit is dBm, range 30-60. Example threshold: 46.0\n"
+            "You MUST include at least one actuatable parameter in your constraints, otherwise no action will be taken.\n"
             "NEVER use throughput-scale numbers (millions) for latency thresholds or vice versa."
         )
         
@@ -102,6 +110,44 @@ class CognitiveAgent:
             logger.error(f"[COGNITIVE] JSON Parse or Generation Error: {e}")
             return {}
 
+    def _generate_reflection(self, prompt: str) -> str:
+        """Generate free-form text (not JSON) for self-reflection.
+
+        Uses a different system prompt since reflections are verbal analysis,
+        not structured OTM output. This is the Reflexion (Shinn et al., 2023)
+        self-reflection actor: it analyzes WHY an episode succeeded or failed
+        and produces actionable guidance for future episodes.
+        """
+        if not self.model:
+            return ""
+
+        with self._model_lock:
+            return self._generate_reflection_locked(prompt)
+
+    def _generate_reflection_locked(self, prompt: str) -> str:
+        system_prompt = (
+            "You are a 5G Network AI performing self-reflection on a recent network management episode. "
+            "Analyze WHY the outcome occurred and WHAT should be done differently next time. "
+            "Be concise (2-3 sentences). Focus on actionable operational insight, not generic advice. "
+            "Output plain text only — no JSON, no markdown, no bullet points."
+        )
+
+        try:
+            response = self.model.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=256,
+                temperature=0.3,  # Slightly more creative than OTM generation
+            )
+            text = response["choices"][0]["message"]["content"].strip()
+            logger.info(f"[COGNITIVE] Reflection generated: {text[:100]}...")
+            return text
+        except Exception as e:
+            logger.error(f"[COGNITIVE] Reflection generation failed: {e}")
+            return ""
+
     def _cache_system_prefix(self):
         # tokenize the fixed system prompt once so we can prepend it cheaply.
         sys_msg = [{"role": "system",
@@ -123,6 +169,80 @@ class CognitiveAgent:
             torch.cuda.synchronize()
         logger.info("[INIT] LLM warmup complete (2 passes)")
 
+
+    # Actuatable KPIs that the ConstraintExecutor can translate to E2 commands
+    _ACTUATABLE_KPIS = {"dl_mcs_max", "tx_power_dbm"}
+
+    # When the LLM omits actuatable constraints, inject defaults tuned
+    # for the objective KPI. The constraint executor will further bias these.
+    _FALLBACK_BY_OBJECTIVE = {
+        # Minimize latency: conservative MCS cap, moderate TX power boost
+        "DRB_PdcpSduDelayDl": [
+            {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
+             "threshold": 24.0, "unit": "", "id": "FALLBACK_MCS"},
+            {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge",
+             "threshold": 46.0, "unit": "dBm", "id": "FALLBACK_PWR"},
+        ],
+        "UE_DRB_PdcpSduDelayDl_UEID": [
+            {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
+             "threshold": 24.0, "unit": "", "id": "FALLBACK_MCS"},
+            {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge",
+             "threshold": 46.0, "unit": "dBm", "id": "FALLBACK_PWR"},
+        ],
+        # Maximize throughput: Give it full MCS, standard power
+        "UE_DRB_UEThpDl_UEID": [
+            {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
+             "threshold": 28.0, "unit": "", "id": "FALLBACK_MCS"},
+            {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge",
+             "threshold": 46.0, "unit": "dBm", "id": "FALLBACK_PWR"},
+        ],
+        # Minimize BLER: Moderate MCS drop, high power
+        "UE_DRB_BlerDl_UEID": [
+            {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
+             "threshold": 20.0, "unit": "", "id": "FALLBACK_MCS"},
+            {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge",
+             "threshold": 48.0, "unit": "dBm", "id": "FALLBACK_PWR"},
+        ],
+    }
+    # Generic fallback when objective KPI is unknown
+    _DEFAULT_CONSTRAINTS = [
+        {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
+         "threshold": 20.0, "unit": "", "id": "FALLBACK_MCS"},
+        {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge",
+         "threshold": 46.0, "unit": "dBm", "id": "FALLBACK_PWR"},
+    ]
+
+    def _ensure_actuatable_constraints(self, otm: dict) -> dict:
+        """Validate that the OTM contains at least one actuatable constraint.
+
+        If the LLM only produced observational constraints (e.g. latency thresholds),
+        inject objective-aware defaults so the ConstraintExecutor has something to execute.
+        """
+        constraints = otm.get("constraints", [])
+        has_actuatable = any(
+            c.get("kpi") in self._ACTUATABLE_KPIS for c in constraints
+        )
+        if not has_actuatable:
+            obj_kpi = otm.get("objective", {}).get("kpi", "")
+            fallback = self._FALLBACK_BY_OBJECTIVE.get(obj_kpi, self._DEFAULT_CONSTRAINTS)
+            # Deep copy to avoid mutating class-level defaults
+            fallback_copy = [dict(c) for c in fallback]
+
+            logger.warning(f"[COGNITIVE] LLM produced no actuatable constraints — "
+                           f"injecting objective-aware defaults for '{obj_kpi or 'unknown'}'.")
+            otm.setdefault("constraints", []).extend(fallback_copy)
+            
+            #ensure adaptation_log is always a list in case llm doesnt adhere to the schema
+            metadata = otm.setdefault("metadata", {})
+            if isinstance(metadata.get("adaptation_log"), str):
+                metadata["adaptation_log"] = [metadata["adaptation_log"]]
+            elif not isinstance(metadata.get("adaptation_log"), list):
+                metadata["adaptation_log"] = []
+                
+            metadata["adaptation_log"].append(
+                f"System injected fallback actuatable constraints for objective '{obj_kpi}' (LLM omitted them)."
+            )
+        return otm
 
     @staticmethod
     def _parse_temporal(text: str, schedule_context: list = None) -> dict:
@@ -236,28 +356,97 @@ class CognitiveAgent:
             "deactivate_at_utc": deactivate_at.isoformat() if deactivate_at else None,
         }
 
+    async def _reflection_loop(self):
+        """Separate loop for Reflexion self-reflections (Shinn et al., 2023).
+
+        Runs on its own bus topic (ai.reflect) so reflections never block
+        urgent OTM generation/adaptation on the main ai.request queue.
+        Uses a dedicated ThreadPoolExecutor to avoid contending with OTM generation.
+        """
+        q_reflect = await self.bus.sub("ai.reflect")
+        reflect_executor = ThreadPoolExecutor(max_workers=1)
+        logger.info("[COGNITIVE] Reflection loop online (ai.reflect).")
+
+        while True:
+            msg = await q_reflect.get()
+            payload = msg.payload
+            episode = payload.get("episode", {})
+            episode_id = payload.get("episode_id")
+            anomaly = episode.get("anomaly", {})
+            outcome = episode.get("outcome", {})
+            otm = episode.get("otm_prescribed", {})
+
+            resolved_str = "RESOLVED" if outcome.get("resolved") else "FAILED"
+            metric = anomaly.get("metric", "unknown")
+            val_before = anomaly.get("value", "?")
+            val_after = outcome.get("metric_after", "?")
+
+            constraints_str = json.dumps(otm.get("constraints", []), indent=2) if otm.get("constraints") else "none"
+            proc_id = otm.get("procedure_id", "none")
+
+            reflect_prompt = (
+                f"Analyze this network management episode:\n"
+                f"- Metric: {metric}\n"
+                f"- Value before: {val_before}, after: {val_after}\n"
+                f"- Outcome: {resolved_str}\n"
+                f"- Procedure used: {proc_id}\n"
+                f"- Constraints applied: {constraints_str}\n\n"
+                f"Explain WHY this outcome occurred and WHAT should be done differently next time "
+                f"(or what to repeat if it worked). Be specific to the parameter values."
+            )
+
+            loop = asyncio.get_running_loop()
+            reflection_text = await loop.run_in_executor(
+                reflect_executor, self._generate_reflection, reflect_prompt
+            )
+
+            if reflection_text and self.episode_store and episode_id:
+                self.episode_store.add_reflection(episode_id, reflection_text)
+                logger.info(f"[COGNITIVE] Reflexion stored for episode {episode_id[:8]}")
+            elif not reflection_text:
+                logger.warning(f"[COGNITIVE] Empty reflection for episode {episode_id[:8] if episode_id else '?'}")
+
     async def run(self):
         q = await self.bus.sub("ai.request")
+
+        # Launch reflection loop as independent task — never blocks OTM generation
+        asyncio.create_task(self._reflection_loop())
+
         logger.info("Cognitive agent online.")
-        
+
         while True:
             msg = await q.get()
             payload = msg.payload
-            
+
             prompt = ""
             
             # Telemetric anomaly
             if payload.get("type") == "generate_otm":
                 metric = payload.get("metric")
                 val = payload.get("value")
-                
+
                 # RAG from grounding layer (mock for now)
                 kb_recommendations = self.kb.query_scenario(metric)
                 rec_str = json.dumps(kb_recommendations) if kb_recommendations else "None."
 
+                # RAG from episodic memory — retrieve similar past experiences
+                experience_block = ""
+                if self.episode_store:
+                    episodes = self.episode_store.retrieve(
+                        {"metric": metric, "value": val}, k=3
+                    )
+                    if episodes:
+                        experience_block = (
+                            f"\nPAST EXPERIENCE (similar situations and their outcomes):\n"
+                            f"{self.episode_store.format_for_prompt(episodes)}\n\n"
+                            f"Use these past experiences to inform your decision. "
+                            f"Prefer strategies that RESOLVED the issue. Avoid strategies that FAILED.\n"
+                        )
+
                 prompt = (
                     f"NETWORK ANOMALY: The metric '{metric}' has degraded to a value of {val}.\n"
                     f"KNOWLEDGE BASE PROCEDURES: {rec_str}\n\n"
+                    f"{experience_block}"
                     f"TASK:\n"
                     f"1. Generate a strict OTM JSON to fix this issue using the procedures.\n"
                     f"2. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in bps (e.g., 50000000.0). DO NOT mix up these numbers!\n"
@@ -329,12 +518,41 @@ class CognitiveAgent:
                 prev_otm = payload.get("previous_otm")
                 val = payload.get("value")
 
+                # RAG from episodic memory — retrieve similar past adaptations
+                experience_block = ""
+                if self.episode_store:
+                    episodes = self.episode_store.retrieve(
+                        {"metric": metric, "value": val}, k=3
+                    )
+                    if episodes:
+                        experience_block = (
+                            f"\nPAST EXPERIENCE (similar adaptations and their outcomes):\n"
+                            f"{self.episode_store.format_for_prompt(episodes)}\n\n"
+                            f"Learn from these past adaptations. Repeat what RESOLVED the issue. Avoid what FAILED.\n"
+                        )
+
+                # Show APPLIED values (what actually went to ns-3), not just thresholds.
+                # The constraint executor writes 'applied_value' into each constraint
+                # after objective-biased parameter selection.
+                prev_constraints = prev_otm.get("constraints", [])
+                constraints_for_llm = []
+                for c in prev_constraints:
+                    entry = f"{c.get('kpi')} {c.get('operator')} {c.get('threshold')}"
+                    applied = c.get("applied_value")
+                    if applied is not None and applied != c.get("threshold"):
+                        entry += f" (actual applied: {applied})"
+                    constraints_for_llm.append(entry)
+                constraints_str = "\n".join(f"  - {e}" for e in constraints_for_llm) if constraints_for_llm else "none"
+
                 prompt = (
                     f"ADAPTATION REQUIRED: The network procedure paused because metric '{metric}' failed a health check or is still deviating (current value: {val}).\n"
-                    f"Active OTM Constraints that caused/failed to fix this: {json.dumps(prev_otm.get('constraints', []))}\n\n"
+                    f"Active OTM Constraints that failed to fix this:\n{constraints_str}\n\n"
+                    f"NOTE: 'actual applied' shows the real parameter value sent to the network after objective-aware biasing. "
+                    f"Your new threshold will also be biased — set it HIGHER than your target if the bias lowers it, or LOWER if the bias raises it.\n\n"
+                    f"{experience_block}"
                     f"TASK:\n"
-                    f"1. Make MARGINAL, incremental relaxations (e.g., adjust a threshold by 10-20%) so the health check barely passes.\n"
-                    f"2. Generate an updated OTM JSON with these slightly relaxed constraints.\n"
+                    f"1. Make MARGINAL, incremental adjustments to the constraint thresholds.\n"
+                    f"2. Generate an updated OTM JSON with adjusted constraints.\n"
                     f"3. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in bps (e.g., 50000000.0). DO NOT mix up these numbers!\n"
                     f"4. Keep the 'adaptation_log' EXTREMELY BRIEF (MAXIMUM 1 short sentence summarizing the change). Do NOT write an essay.\n\n"
                     f"STRICT SCHEMA TO FOLLOW:\n{OTM_SCHEMA_TEMPLATE}"
@@ -360,23 +578,28 @@ class CognitiveAgent:
                 )
 
             # Merge: anomaly arrived while a user/proactive OTM was active
+            # Merge: anomaly arrived while a user/proactive OTM was active
             elif payload.get("type") == "merge_otm":
                 active_otm = payload.get("active_otm", {})
                 anomaly = payload.get("anomaly", {})
                 anomaly_metric = anomaly.get("metric", "unknown")
                 anomaly_value = anomaly.get("value", "unknown")
-                anomaly_target = anomaly.get("target", 40.0)
-                op = "le" if anomaly.get("direction", "lower_better") == "lower_better" else "ge"
+                
+                # Fetch procedures for the new anomaly
+                kb_recommendations = self.kb.query_scenario(anomaly_metric)
+                rec_str = json.dumps(kb_recommendations) if kb_recommendations else "None."
 
                 prompt = (
                     f"MERGE REQUEST: A network anomaly has occurred on '{anomaly_metric}' "
                     f"(current value: {anomaly_value}) while the following OTM is active:\n"
                     f"{json.dumps(active_otm)}\n\n"
-                    f"TASK: Generate a MERGED OTM JSON that:\n"
-                    f"1. PRESERVES the original objective and ALL existing constraints from the active OTM above.\n"
-                    f"2. ADDS a new constraint: '{anomaly_metric}' {op} {anomaly_target}.\n"
-                    f"3. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in bps (e.g., 50000000.0). DO NOT mix up these numbers!\n"
-                    f"4. Keep the 'adaptation_log' brief, motivate your reasoning. One or two sentences should suffice.\n"
+                    f"KNOWLEDGE BASE PROCEDURES FOR NEW ANOMALY: {rec_str}\n\n"
+                    f"TASK: Generate a MERGED OTM JSON that handles both the active OTM and the new anomaly.\n"
+                    f"1. PRESERVE the original objective and existing actuatable constraints from the active OTM if possible.\n"
+                    f"2. Add NEW actuatable constraints (dl_mcs_max, tx_power_dbm) to address the '{anomaly_metric}' anomaly, using the Knowledge Base procedures as a guide.\n"
+                    f"3. Do NOT add observational metrics (like Latency or Throughput) to the constraints array. Only add parameters the system can actuate.\n"
+                    f"4. If new constraints conflict with old ones (e.g., both set an MCS cap), prioritize the MORE CONSERVATIVE constraint (lower MCS, higher TX Power) to ensure stability.\n"
+                    f"5. Keep the 'adaptation_log' brief, motivate your reasoning. One or two sentences should suffice.\n"
                     f"STRICT SCHEMA TO FOLLOW:\n{OTM_SCHEMA_TEMPLATE}"
                 )
 
@@ -386,7 +609,13 @@ class CognitiveAgent:
             logger.info(f"[COGNITIVE] Prompting LLM.")
             loop = asyncio.get_running_loop()
             otm_json = await loop.run_in_executor(self.executor, self._generate, prompt)
-            
+
+            # Validate: ensure at least one actuatable constraint exists.
+            # Without dl_mcs_max or tx_power_dbm the ConstraintExecutor can't
+            # dispatch any E2 commands and the system appears to act but does nothing.
+            if otm_json and "objective" in otm_json:
+                otm_json = self._ensure_actuatable_constraints(otm_json)
+
             # Inject runtime variables about the metadata that the LLM can't know
             if otm_json and "objective" in otm_json:
                 otm_json.setdefault("metadata", {})
@@ -430,7 +659,16 @@ class CognitiveAgent:
                 elif req_type in ("merge_otm", "merge_manual"):
                     prev_log = payload.get("active_otm", {}).get("metadata", {}).get("adaptation_log", [])
 
+                # ensure current_log is a list before iterating
                 current_log = otm_json["metadata"].get("adaptation_log", [])
+                if isinstance(current_log, str):
+                    current_log = [current_log]
+                elif not isinstance(current_log, list):
+                    current_log = []
+                
+                # Write the sanitized list back to the JSON just to be extra safe
+                otm_json["metadata"]["adaptation_log"] = current_log
+
                 merged_log = list(prev_log)
                 for entry in current_log:
                     if entry not in merged_log:

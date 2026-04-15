@@ -18,7 +18,7 @@ class ActuatorAgent:
         q_sim = await self.bus.sub("sim.control")
         q_actor = await self.bus.sub("actor.apply")
 
-        logger.info("[ACTUATOR] Bridge established: Bus → E2 Relay (chaos + RL commands)")
+        logger.info("[ACTUATOR] Bridge established: Bus → E2 Relay (chaos + control commands)")
 
         while True:
             while not q_sim.empty():
@@ -44,9 +44,9 @@ class ActuatorAgent:
                         if action.type == "REPORTING":
                             continue
 
-                        cmd_body = self._translate_rl_action(action)
+                        cmd_body = self._translate_action(action)
                         if cmd_body:
-                            logger.info(f"[ACTUATOR] Translating RL Action {action.type} -> E2 Command: {cmd_body}")
+                            logger.info(f"[ACTUATOR] Translating {action.type} -> E2 Command: {cmd_body}")
                             await self.bus.pub("xapp.control", make_msg("actuator", "CMD", "v1", cmd_body))
                             # Publish E2 ack so the Orchestrator can verify commands were dispatched
                             await self.bus.pub("command.notify", make_msg(
@@ -65,8 +65,8 @@ class ActuatorAgent:
         # Hard fallback for the specific ns-3 topology
         return 2
 
-    def _translate_rl_action(self, action):
-        """Translates abstract RL ActionSpace types into strict xApp/ns-3 E2 commands."""
+    def _translate_action(self, action):
+        """Translate abstract action types into strict xApp/ns-3 E2 commands."""
         cmd_body = None
         node_id = self._resolve_node_id(action)
 
