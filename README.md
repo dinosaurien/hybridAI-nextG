@@ -27,6 +27,10 @@ Hybrid AI system for autonomous 5G/6G network optimization. Combines a Deep Rein
 Install dependencies:
 
 ```bash
+poetry config keyring.enabled false
+```
+
+```bash
 poetry install --no-root
 ```
 
