@@ -14,6 +14,30 @@ from llama_cpp import Llama
 
 logger = logging.getLogger(__name__)
 
+# Intent-feasibility vocabulary: only accept manual intents whose text hits
+# at least one scenario keyword. Derived from the RDF scenarios in
+# knowledge_base.py. Follows TMF IG1253 / 3GPP TR 28.312 intent validation
+# pattern — reject out-of-vocabulary intents instead of scenario-guessing.
+MANUAL_INTENT_VOCAB = {
+    "latency", "delay", "congestion", "lag", "slow",
+    "throughput", "bandwidth", "data rate", "speed",
+    "bler", "block error", "error rate", "errors",
+    "energy", "power", "tx power", "txpower", "green", "save",
+    "upgrade", "maintenance", "drain",
+    "mcs", "modulation",
+    "drb_pdcpsdudelaydl", "ue_drb_pdcpsdudelaydl_ueid",
+    "ue_drb_uethpdl_ueid", "ue_drb_blerdl_ueid",
+    "tx_power_dbm", "dl_mcs_max", "bler_dl",
+}
+
+
+def _manual_intent_in_vocabulary(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(kw in lowered for kw in MANUAL_INTENT_VOCAB)
+
+
 OTM_SCHEMA_TEMPLATE = """
 {
   "version": "1.0",
@@ -169,80 +193,6 @@ class CognitiveAgent:
             torch.cuda.synchronize()
         logger.info("[INIT] LLM warmup complete (2 passes)")
 
-
-    # Actuatable KPIs that the ConstraintExecutor can translate to E2 commands
-    _ACTUATABLE_KPIS = {"dl_mcs_max", "tx_power_dbm"}
-
-    # When the LLM omits actuatable constraints, inject defaults tuned
-    # for the objective KPI. The constraint executor will further bias these.
-    _FALLBACK_BY_OBJECTIVE = {
-        # Minimize latency: conservative MCS cap, moderate TX power boost
-        "DRB_PdcpSduDelayDl": [
-            {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
-             "threshold": 24.0, "unit": "", "id": "FALLBACK_MCS"},
-            {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge",
-             "threshold": 46.0, "unit": "dBm", "id": "FALLBACK_PWR"},
-        ],
-        "UE_DRB_PdcpSduDelayDl_UEID": [
-            {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
-             "threshold": 24.0, "unit": "", "id": "FALLBACK_MCS"},
-            {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge",
-             "threshold": 46.0, "unit": "dBm", "id": "FALLBACK_PWR"},
-        ],
-        # Maximize throughput: Give it full MCS, standard power
-        "UE_DRB_UEThpDl_UEID": [
-            {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
-             "threshold": 28.0, "unit": "", "id": "FALLBACK_MCS"},
-            {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge",
-             "threshold": 46.0, "unit": "dBm", "id": "FALLBACK_PWR"},
-        ],
-        # Minimize BLER: Moderate MCS drop, high power
-        "UE_DRB_BlerDl_UEID": [
-            {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
-             "threshold": 20.0, "unit": "", "id": "FALLBACK_MCS"},
-            {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge",
-             "threshold": 48.0, "unit": "dBm", "id": "FALLBACK_PWR"},
-        ],
-    }
-    # Generic fallback when objective KPI is unknown
-    _DEFAULT_CONSTRAINTS = [
-        {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
-         "threshold": 20.0, "unit": "", "id": "FALLBACK_MCS"},
-        {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge",
-         "threshold": 46.0, "unit": "dBm", "id": "FALLBACK_PWR"},
-    ]
-
-    def _ensure_actuatable_constraints(self, otm: dict) -> dict:
-        """Validate that the OTM contains at least one actuatable constraint.
-
-        If the LLM only produced observational constraints (e.g. latency thresholds),
-        inject objective-aware defaults so the ConstraintExecutor has something to execute.
-        """
-        constraints = otm.get("constraints", [])
-        has_actuatable = any(
-            c.get("kpi") in self._ACTUATABLE_KPIS for c in constraints
-        )
-        if not has_actuatable:
-            obj_kpi = otm.get("objective", {}).get("kpi", "")
-            fallback = self._FALLBACK_BY_OBJECTIVE.get(obj_kpi, self._DEFAULT_CONSTRAINTS)
-            # Deep copy to avoid mutating class-level defaults
-            fallback_copy = [dict(c) for c in fallback]
-
-            logger.warning(f"[COGNITIVE] LLM produced no actuatable constraints — "
-                           f"injecting objective-aware defaults for '{obj_kpi or 'unknown'}'.")
-            otm.setdefault("constraints", []).extend(fallback_copy)
-            
-            #ensure adaptation_log is always a list in case llm doesnt adhere to the schema
-            metadata = otm.setdefault("metadata", {})
-            if isinstance(metadata.get("adaptation_log"), str):
-                metadata["adaptation_log"] = [metadata["adaptation_log"]]
-            elif not isinstance(metadata.get("adaptation_log"), list):
-                metadata["adaptation_log"] = []
-                
-            metadata["adaptation_log"].append(
-                f"System injected fallback actuatable constraints for objective '{obj_kpi}' (LLM omitted them)."
-            )
-        return otm
 
     @staticmethod
     def _parse_temporal(text: str, schedule_context: list = None) -> dict:
@@ -473,7 +423,7 @@ class CognitiveAgent:
                     anomaly_ctx = {
                         "metric": metric,
                         "value": val,
-                        "scope": payload.get("scope") or {"cell_id": "CELL_001"},
+                        "scope": payload.get("scope") or {},
                     }
                     reflections = self.episode_store.get_recent_reflections(anomaly_ctx)
                     if reflections:
@@ -495,8 +445,17 @@ class CognitiveAgent:
 
             # Manual user request (also RAG from kb, and scheduling for future intents logic exists)
             elif payload.get("type") == "manual":
-                user_text = payload.get("text")
-                
+                user_text = payload.get("text") or ""
+
+                if not _manual_intent_in_vocabulary(user_text):
+                    logger.warning(f"[COGNITIVE] Manual intent REJECTED (out of KB vocabulary): '{user_text}'")
+                    await self.bus.pub("ai.response", make_msg("opt", "LLM_FAILURE", "v1", {
+                        "error": f"Manual intent out of KB vocabulary: '{user_text}'",
+                        "request_type": "manual",
+                        "reason": "intent_infeasible",
+                    }, corr_id=msg.corr_id))
+                    continue
+
                 # Fetch the semantic knowledge from the RDF Graph
                 rdf_context = self.kb.get_rdf_scenarios_for_llm()
                 
@@ -524,7 +483,16 @@ class CognitiveAgent:
             elif payload.get("type") == "merge_manual":
                 active_otm = payload.get("active_otm", {})
                 user_text = payload.get("text", "")
-                
+
+                if not _manual_intent_in_vocabulary(user_text):
+                    logger.warning(f"[COGNITIVE] Manual intent REJECTED (out of KB vocabulary, active OTM preserved): '{user_text}'")
+                    await self.bus.pub("ai.response", make_msg("opt", "LLM_FAILURE", "v1", {
+                        "error": f"Manual intent out of KB vocabulary: '{user_text}'",
+                        "request_type": "merge_manual",
+                        "reason": "intent_infeasible",
+                    }, corr_id=msg.corr_id))
+                    continue
+
                 clean_otm = {
                     "objective": active_otm.get("objective", {}),
                     "constraints": active_otm.get("constraints", [])
@@ -566,7 +534,7 @@ class CognitiveAgent:
                     anomaly_ctx = {
                         "metric": metric,
                         "value": val,
-                        "scope": payload.get("scope") or {"cell_id": "CELL_001"},
+                        "scope": payload.get("scope") or {},
                     }
                     reflections = self.episode_store.get_recent_reflections(anomaly_ctx)
                     if reflections:
@@ -598,7 +566,8 @@ class CognitiveAgent:
                     f"1. Make MARGINAL, incremental adjustments to the constraint thresholds.\n"
                     f"2. Generate an updated OTM JSON with adjusted constraints.\n"
                     f"3. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in bps (e.g., 50000000.0). DO NOT mix up these numbers!\n"
-                    f"4. Keep the 'adaptation_log' EXTREMELY BRIEF (MAXIMUM 1 short sentence summarizing the change). Do NOT write an essay.\n\n"
+                    f"4. CRITICAL: Use the STABLE procedure id in each constraint's 'id' field so the orchestrator updates the existing procedure constraint in place instead of duplicating it. Use id='PROC_MCS' for dl_mcs_max constraints and id='PROC_TXPOW' for tx_power_dbm constraints. Example: {{\"service\":\"mbb\",\"kpi\":\"dl_mcs_max\",\"operator\":\"le\",\"threshold\":16,\"unit\":\"\",\"id\":\"PROC_MCS\"}}.\n"
+                    f"5. Keep the 'adaptation_log' EXTREMELY BRIEF (MAXIMUM 1 short sentence summarizing the change). Do NOT write an essay.\n\n"
                     f"STRICT SCHEMA TO FOLLOW:\n{OTM_SCHEMA_TEMPLATE}"
                 )
             
@@ -641,7 +610,7 @@ class CognitiveAgent:
                     anomaly_ctx = {
                         "metric": anomaly_metric,
                         "value": anomaly_value,
-                        "scope": anomaly.get("scope") or {"cell_id": "CELL_001"},
+                        "scope": anomaly.get("scope") or {},
                     }
                     reflections = self.episode_store.get_recent_reflections(anomaly_ctx)
                     if reflections:
@@ -671,12 +640,6 @@ class CognitiveAgent:
             logger.info(f"[COGNITIVE] Prompting LLM.")
             loop = asyncio.get_running_loop()
             otm_json = await loop.run_in_executor(self.executor, self._generate, prompt)
-
-            # Validate: ensure at least one actuatable constraint exists.
-            # Without dl_mcs_max or tx_power_dbm the ConstraintExecutor can't
-            # dispatch any E2 commands and the system appears to act but does nothing.
-            if otm_json and "objective" in otm_json:
-                otm_json = self._ensure_actuatable_constraints(otm_json)
 
             # Inject runtime variables about the metadata that the LLM can't know
             if otm_json and "objective" in otm_json:

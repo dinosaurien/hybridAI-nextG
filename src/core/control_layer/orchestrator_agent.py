@@ -128,6 +128,7 @@ class OrchestratorAgent:
             # Timeout: if LLM hasn't responded, unlock the loop
             if self.state == IntentState.THINKING and current_time >= self.thinking_start_time + self.THINKING_TIMEOUT:
                 logger.warning("[ORCHESTRATOR] THINKING timeout reached — Cognitive Core did not respond. Returning to MONITORING.")
+                self._clear_anomaly_state()
                 self.state = IntentState.MONITORING
 
             # ESCALATED auto-unlock: don't stay frozen forever if no human intervenes
@@ -162,6 +163,7 @@ class OrchestratorAgent:
                             # No more steps — procedure complete. Record final episode.
                             await self._record_and_reflect(resolved=True)
                             await self._complete_procedure()
+                            await self._release_anomaly_otm_if_needed()
                             self._clear_anomaly_state()
                             self.state = IntentState.MONITORING
                         # else: intermediate step — _advance_procedure set state to ASSURANCE, no episode yet
@@ -169,6 +171,7 @@ class OrchestratorAgent:
                         # No procedure — simple anomaly→OTM→resolved cycle. Record episode.
                         await self._record_and_reflect(resolved=True)
                         logger.info("[ORCHESTRATOR] WITHDRAWAL: Deviation resolved. Returning to MONITORING.")
+                        await self._release_anomaly_otm_if_needed()
                         self._clear_anomaly_state()
                         self.state = IntentState.MONITORING
                 else:
@@ -206,7 +209,8 @@ class OrchestratorAgent:
                         await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
                             "type": "adapt_otm", "metric": metric,
                             "value": self.last_metric_value,
-                            "previous_otm": self.active_otm
+                            "previous_otm": self.active_otm,
+                            "scope": (self.triggering_anomaly or {}).get("scope") or {},
                         }))
 
             # Graceful cancel revert: apply when system settles back to MONITORING
@@ -285,11 +289,14 @@ class OrchestratorAgent:
 
                     await self.bus.pub("deviation.broadcast", make_msg("orch", "DEV", "v1", dev, corr_id=msg.corr_id))
 
+                    anomaly_scope = dev.get("scope") or {}
                     if self.active_otm and self.active_anomaly_metric == metric:
                         # Same metric failing again: tighten existing constraints
                         logger.warning(f"[ORCHESTRATOR] Persistent failure on {metric}. Requesting ADAPTATION. (Trace: {msg.corr_id})")
                         await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
-                            "type": "adapt_otm", "metric": metric, "value": dev['value'], "previous_otm": self.active_otm
+                            "type": "adapt_otm", "metric": metric, "value": dev['value'],
+                            "previous_otm": self.active_otm,
+                            "scope": anomaly_scope,
                         }, corr_id=msg.corr_id))
                     elif self.active_otm:
                         # Different metric or manual OTM active: merge anomaly into active OTM
@@ -303,13 +310,16 @@ class OrchestratorAgent:
                                 "target": dev.get('target', 40.0),
                                 "direction": dev.get('direction', 'lower_better'),
                                 "severity": dev.get('severity', 'medium'),
-                            }
+                                "scope": anomaly_scope,
+                            },
+                            "scope": anomaly_scope,
                         }, corr_id=msg.corr_id))
                     else:
                         # No active OTM: generate fresh
                         logger.info(f"[ORCHESTRATOR] Requesting NEW OTM from Cognitive Core. (Trace: {msg.corr_id})")
                         await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
-                            "type": "generate_otm", "metric": metric, "value": dev['value']
+                            "type": "generate_otm", "metric": metric, "value": dev['value'],
+                            "scope": anomaly_scope,
                         }, corr_id=msg.corr_id))
                     self.active_anomaly_metric = metric
                     break
@@ -338,9 +348,29 @@ class OrchestratorAgent:
                 self.thinking_start_time = time.time()
                 self.e2_acks_received = 0
                 self.active_anomaly_metric = metric
-                await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
-                    "type": "generate_otm", "metric": metric, "value": latest['value']
-                }))
+
+                # If a safe-mode OTM is still active from the ESCALATED path,
+                # merge the new anomaly into it rather than regenerating from scratch.
+                if self.active_otm:
+                    await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
+                        "type": "merge_otm",
+                        "active_otm": self.active_otm,
+                        "anomaly": {
+                            "metric": metric,
+                            "value": latest['value'],
+                            "target": latest.get('target', 40.0),
+                            "direction": latest.get('direction', 'lower_better'),
+                            "severity": latest.get('severity', 'medium'),
+                            "scope": scope,
+                        },
+                        "scope": scope,
+                    }))
+                else:
+                    await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
+                        "type": "generate_otm", "metric": metric,
+                        "value": latest['value'],
+                        "scope": scope,
+                    }))
 
             while not q_otm.empty():
                 msg = q_otm.get_nowait()
@@ -350,6 +380,7 @@ class OrchestratorAgent:
                     self._log_event("llm_generation_failed",
                                     error=msg.payload.get("error"),
                                     request_type=msg.payload.get("request_type"))
+                    self._clear_anomaly_state()
                     self.state = IntentState.MONITORING
 
                 else:
@@ -424,12 +455,18 @@ class OrchestratorAgent:
         # Stamp the anomaly scope into OTM metadata so downstream actuators
         # (NetworkOptimizer → ConstraintExecutor → xApp) know which cell/UE
         # this intent targets, instead of falling back to CELL_001.
+        meta = otm.setdefault("metadata", {})
         if self.active_cell_id or self.active_ue_id:
-            meta = otm.setdefault("metadata", {})
             if self.active_cell_id and not meta.get("cell_id"):
                 meta["cell_id"] = self.active_cell_id
             if self.active_ue_id and not meta.get("ue_id"):
                 meta["ue_id"] = self.active_ue_id
+
+        # Tag OTM source so the release path (WITHDRAWAL-resolved) can drop
+        # anomaly-driven OTMs back to baseline while keeping manual/scheduled
+        # intents in force.
+        if not meta.get("source"):
+            meta["source"] = "anomaly" if self.triggering_anomaly else "operator"
 
         self.active_otm = otm
         self.state = IntentState.ASSURANCE
@@ -477,6 +514,41 @@ class OrchestratorAgent:
 
         asyncio.create_task(self.bus.pub("intent.execute", make_msg("orch", "NEW_TARGET", "v1", self.active_otm)))
 
+    async def _release_anomaly_otm_if_needed(self):
+        """Drop an anomaly-driven active_otm after resolution and push a
+        baseline-revert OTM so ns-3 actuators return to default parameters.
+        Manual/scheduled/escalated OTMs are preserved.
+        """
+        otm = self.active_otm
+        if not otm:
+            return
+        source = otm.get("metadata", {}).get("source")
+        if source != "anomaly":
+            return
+
+        now_str = datetime.now(timezone.utc).isoformat()
+        logger.info("[ORCHESTRATOR] Anomaly resolved — releasing active_otm and reverting actuators to baseline.")
+
+        baseline_otm = {
+            "version": "1.0",
+            "objective": {"service": "mbb", "kpi": "baseline", "aggregation": "mean", "unit": "", "maximize": False},
+            "constraints": [
+                {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le", "threshold": 28, "unit": "", "id": "BASELINE_MCS", "origin": "baseline_revert"},
+                {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge", "threshold": 46.0, "unit": "dBm", "id": "BASELINE_PWR", "origin": "baseline_revert"},
+            ],
+            "metadata": {
+                "timescale": "10s_window",
+                "source": "baseline_revert",
+                "procedure_id": None,
+                "cell_id": self.active_cell_id,
+                "ue_id": self.active_ue_id,
+                "adaptation_log": [f"[{now_str}] Anomaly resolved — reverting to baseline actuators."],
+            },
+        }
+
+        self.active_otm = None
+        await self.bus.pub("intent.execute", make_msg("orch", "BASELINE_REVERT", "v1", baseline_otm))
+
     async def _evaluate_withdrawal(self) -> bool:
         """Check whether the anomaly metric has recovered.
 
@@ -486,8 +558,14 @@ class OrchestratorAgent:
         Episode recording is handled separately by _record_and_reflect() at
         cycle boundaries (not every intermediate procedure step).
         """
-        if self.last_metric_value is None or self.active_anomaly_metric is None:
+        if self.active_anomaly_metric is None:
+            # Nothing to evaluate (state-machine reached withdrawal without an
+            # active anomaly — e.g. a scheduled-intent activation path).
             resolved = True
+        elif self.last_metric_value is None:
+            # Active anomaly but no telemetry in the withdrawal window — treat
+            # as unresolved rather than silently concluding success.
+            resolved = False
         else:
             thresholds = self.kb.get_health_thresholds(self.active_cell_id or "default")
             metric = self.active_anomaly_metric
@@ -910,6 +988,7 @@ class OrchestratorAgent:
             self.active_otm = None
 
         self.active_procedure = None
+        self._clear_anomaly_state()
         self.state = IntentState.MONITORING
 
     def _append_to_active_log(self, entry: str):

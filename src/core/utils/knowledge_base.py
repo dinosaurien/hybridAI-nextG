@@ -180,7 +180,7 @@ class KnowledgeBase:
             "DIAGNOSIS: Network is experiencing High Latency Congestion.",
             "ACTION: Enforce strict constraints to reduce delay.",
             "OTM_INSTRUCTION: Set an objective to minimize latency (DRB_PdcpSduDelayDl).",
-            "OTM_INSTRUCTION: Leave the 'constraints' array empty. This will be populated later."
+            "OTM_INSTRUCTION: Leave the 'constraints' array empty. The orchestrator will inject actuatable constraints from the procedure catalog."
         ]
 
         for i, step in enumerate(cong_steps):
@@ -201,7 +201,7 @@ class KnowledgeBase:
             "DIAGNOSIS: Network is experiencing Low Downlink Throughput.",
             "ACTION: Increase resource allocation and modulation order.",
             "OTM_INSTRUCTION: Set an objective to maximize throughput (UE_DRB_UEThpDl_UEID).",
-            "OTM_INSTRUCTION: Leave the 'constraints' array empty. This will be populated later."
+            "OTM_INSTRUCTION: Leave the 'constraints' array empty. The orchestrator will inject actuatable constraints from the procedure catalog."
         ]
         for i, step in enumerate(thr_steps):
             step_node = URIRef(self.NS[f"throughput_proc_{i}"])
@@ -222,7 +222,7 @@ class KnowledgeBase:
             "DIAGNOSIS: Network is experiencing High Downlink Block Error Rate.",
             "ACTION: Reduce modulation order and increase transmit power to improve signal reliability.",
             "OTM_INSTRUCTION: Set an objective to minimize BLER (UE_DRB_BlerDl_UEID).",
-            "OTM_INSTRUCTION: Leave the 'constraints' array empty. This will be populated later."
+            "OTM_INSTRUCTION: Leave the 'constraints' array empty. The orchestrator will inject actuatable constraints from the procedure catalog."
         ]
         for i, step in enumerate(bler_steps):
             step_node = URIRef(self.NS[f"bler_proc_{i}"])
@@ -242,7 +242,7 @@ class KnowledgeBase:
             "DIAGNOSIS: Operator has requested an energy-saving configuration.",
             "ACTION: Reduce transmit power and limit modulation to save energy while maintaining baseline service.",
             "OTM_INSTRUCTION: Set an objective to minimize latency (DRB_PdcpSduDelayDl). The procedure constraints will enforce the energy-saving actions; the objective ensures QoS is maintained.",
-            "OTM_INSTRUCTION: Leave the 'constraints' array empty. This will be populated later."
+            "OTM_INSTRUCTION: Leave the 'constraints' array empty. The orchestrator will inject actuatable constraints from the procedure catalog."
         ]
         for i, step in enumerate(energy_steps):
             step_node = URIRef(self.NS[f"energy_proc_{i}"])
@@ -262,7 +262,7 @@ class KnowledgeBase:
             "DIAGNOSIS: Operator initiated Cell Maintenance / Software Upgrade.",
             "ACTION: Safely drain traffic and reduce radio parameters to conservative settings.",
             "OTM_INSTRUCTION: Set an objective to minimize latency (DRB_PdcpSduDelayDl). The procedure constraints will enforce conservative settings; the objective ensures QoS is maintained.",
-            "OTM_INSTRUCTION: Leave the 'constraints' array empty. This will be populated later by the Orchestrator."
+            "OTM_INSTRUCTION: Leave the 'constraints' array empty. The orchestrator will inject actuatable constraints from the procedure catalog."
         ]
 
         for i, step in enumerate(maintenance_steps):
