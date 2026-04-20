@@ -40,6 +40,8 @@ class OrchestratorAgent:
         self.withdrawal_end_time = 0.0
         self.active_otm = None
         self.active_anomaly_metric = None
+        self.active_cell_id: Optional[str] = None  # Cell scope of the current anomaly
+        self.active_ue_id: Optional[str] = None    # UE scope (if UE_* metric)
         self.triggering_anomaly: Optional[dict] = None  # Full anomaly payload for episode recording
         self.pending_manual_intents = []
         self.e2_acks_received = 0
@@ -105,8 +107,21 @@ class OrchestratorAgent:
                     self.kpi_history.popleft()
                 
                 if self.active_anomaly_metric:
-                    cell = raw.get("CellMetrics", {})
-                    val = cell.get(self.active_anomaly_metric)
+                    metric = self.active_anomaly_metric
+                    val = None
+                    if metric.startswith("UE_"):
+                        target_ue = None
+                        if self.triggering_anomaly:
+                            target_ue = (self.triggering_anomaly.get("scope") or {}).get("ue_id")
+                        if target_ue is not None:
+                            target_ue = str(target_ue)
+                        for ue in raw.get("UEMetrics", []) or []:
+                            if target_ue is None or str(ue.get("ue_id")) == target_ue:
+                                if metric in ue:
+                                    val = ue[metric]
+                                    break
+                    else:
+                        val = raw.get("CellMetrics", {}).get(metric)
                     if val is not None:
                         self.last_metric_value = float(val)
 
@@ -258,6 +273,9 @@ class OrchestratorAgent:
                 if self.state == IntentState.MONITORING:
                     logger.info(f"[ORCHESTRATOR] Anomaly Detected: {metric} (state: {self.state.name}).")
                     self.triggering_anomaly = dev  # Snapshot for episode recording
+                    scope = dev.get("scope") or {}
+                    self.active_cell_id = scope.get("cell_id")
+                    self.active_ue_id = scope.get("ue_id")
                     self._log_event("anomaly_detected",
                                     metric=metric, value=dev.get('value'),
                                     severity=dev.get('severity', 'unknown'))
@@ -311,6 +329,9 @@ class OrchestratorAgent:
                 metric = latest['metric']
                 logger.info(f"[ORCHESTRATOR] Processing queued anomaly from ESCALATED: {metric}")
                 self.triggering_anomaly = latest
+                scope = latest.get("scope") or {}
+                self.active_cell_id = scope.get("cell_id")
+                self.active_ue_id = scope.get("ue_id")
                 self._log_event("anomaly_detected", metric=metric,
                                 value=latest.get('value'), severity=latest.get('severity', 'unknown'))
                 self.state = IntentState.THINKING
@@ -362,6 +383,8 @@ class OrchestratorAgent:
         """Reset anomaly tracking fields to prevent stale data from contaminating
         future episodes or WITHDRAWAL evaluations."""
         self.active_anomaly_metric = None
+        self.active_cell_id = None
+        self.active_ue_id = None
         self.triggering_anomaly = None
         self.last_metric_value = None
         self.adaptation_cycle_count = 0
@@ -398,6 +421,16 @@ class OrchestratorAgent:
 
     def _apply_otm(self, otm: dict):
         """Common path: activate an OTM immediately (ASSURANCE window)."""
+        # Stamp the anomaly scope into OTM metadata so downstream actuators
+        # (NetworkOptimizer → ConstraintExecutor → xApp) know which cell/UE
+        # this intent targets, instead of falling back to CELL_001.
+        if self.active_cell_id or self.active_ue_id:
+            meta = otm.setdefault("metadata", {})
+            if self.active_cell_id and not meta.get("cell_id"):
+                meta["cell_id"] = self.active_cell_id
+            if self.active_ue_id and not meta.get("ue_id"):
+                meta["ue_id"] = self.active_ue_id
+
         self.active_otm = otm
         self.state = IntentState.ASSURANCE
         self.assurance_end_time = time.time() + 30.0
@@ -456,15 +489,23 @@ class OrchestratorAgent:
         if self.last_metric_value is None or self.active_anomaly_metric is None:
             resolved = True
         else:
-            thresholds = self.kb.get_health_thresholds("CELL_001")
+            thresholds = self.kb.get_health_thresholds(self.active_cell_id or "default")
             metric = self.active_anomaly_metric
 
-            if "delay" in metric.lower() or "latency" in metric.lower():
+            m = metric.lower()
+            if "delay" in m or "latency" in m:
                 limit = thresholds.get("latency_max_ms", 50.0)
                 resolved = self.last_metric_value <= limit
-            elif "thp" in metric.lower() or "throughput" in metric.lower():
-                limit = thresholds.get("throughput_min_mbps", 5.0) * 1e6
+            elif "thp" in m or "throughput" in m:
+                # UEMetrics reports throughput in kbps (xApp emits raw ns-3
+                # kbps; the adapter's *1e6 branch is not taken for most
+                # telemetry paths — see kpms.csv: UE values are ~10k-20k,
+                # inconsistent with bps).  Align the threshold to kbps here.
+                limit = thresholds.get("throughput_min_mbps", 5.0) * 1000.0
                 resolved = self.last_metric_value >= limit
+            elif "bler" in m:
+                limit = thresholds.get("bler_max", 0.1)
+                resolved = self.last_metric_value <= limit
             else:
                 resolved = False
 
@@ -520,10 +561,17 @@ class OrchestratorAgent:
                 outcome=outcome,
             )
 
-            # Build reflection payload using applied values
+            # Canonical Reflexion (Shinn et al. 2023 Algorithm 1): Msr is
+            # invoked ONLY when the evaluator Me reports failure. Successful
+            # trials are still recorded on disk above for audit, but we do
+            # not spend LLM tokens reflecting on outcomes that need no change.
+            if resolved:
+                logger.info(f"[ORCHESTRATOR] Episode {episode_id[:8]} recorded "
+                            f"(resolved=True, no reflection requested).")
+                return
+
             reflect_constraints = constraints_with_applied if constraints_with_applied else []
 
-            # Trigger async self-reflection (Reflexion, Shinn et al. 2023).
             # Published on a separate topic so reflections don't block
             # urgent OTM generation/adaptation on the ai.request queue.
             await self.bus.pub("ai.reflect", make_msg(
@@ -541,7 +589,8 @@ class OrchestratorAgent:
                     },
                 }
             ))
-            logger.info(f"[ORCHESTRATOR] Episode {episode_id[:8]} recorded, reflection requested.")
+            logger.info(f"[ORCHESTRATOR] Episode {episode_id[:8]} recorded "
+                        f"(resolved=False, reflection requested).")
         except Exception as e:
             logger.warning(f"[ORCHESTRATOR] Failed to record episode: {e}")
 

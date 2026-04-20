@@ -141,9 +141,20 @@ PROCEDURE_CATALOG: Dict[str, dict] = {
 }
 
 class KnowledgeBase:
+    # Defaults used when a cell has no override registered.
+    DEFAULT_HEALTH_THRESHOLDS: Dict[str, float] = {
+        "latency_max_ms": 50.0,
+        "throughput_min_mbps": 5.0,
+        "bler_max": 0.1,
+    }
+
     def __init__(self):
         self.graph = Graph()
         self.NS = Namespace("http://hybridAI.org/ontology#")
+        # Per-cell health threshold overrides. Use set_health_thresholds() to
+        # register thresholds for a specific cell at runtime (e.g. E6 multi-cell
+        # configurations). Unregistered cells fall back to DEFAULT_HEALTH_THRESHOLDS.
+        self._cell_health: Dict[str, Dict[str, float]] = {}
         self.populate_mock_data()
 
     def populate_mock_data(self):
@@ -260,9 +271,25 @@ class KnowledgeBase:
             self.graph.add((step_node, self.NS.description, Literal(step)))
             self.graph.add((scen_maint, self.NS.hasStep, step_node))
 
-    def get_health_thresholds(self, cell_id):
-        # Fallback if the cell isn't in our database yet
-        return {'latency_max_ms': 50.0, 'throughput_min_mbps': 5.0}
+    def get_health_thresholds(self, cell_id: Optional[str]) -> Dict[str, float]:
+        """Return health thresholds for a specific cell, falling back to defaults.
+
+        cell_id may be None or a cell not registered via set_health_thresholds —
+        in either case callers receive the default dict. Registered cells
+        override individual keys (missing keys still fall back to defaults).
+        """
+        merged = dict(self.DEFAULT_HEALTH_THRESHOLDS)
+        if cell_id and cell_id in self._cell_health:
+            merged.update(self._cell_health[cell_id])
+        return merged
+
+    def set_health_thresholds(self, cell_id: str, **overrides: float) -> None:
+        """Register per-cell threshold overrides (e.g. from a scenario setup).
+        Unknown keys are accepted silently — callers decide which keys matter.
+        """
+        if not cell_id:
+            return
+        self._cell_health.setdefault(cell_id, {}).update(overrides)
 
     def query_scenario(self, metric_name: str) -> list:
         # Optimized SPARQL query to fetch procedure descriptions based on metric trigger

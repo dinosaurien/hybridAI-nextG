@@ -45,10 +45,6 @@ if [ -f "models/minirocket_xapp_ue.joblib" ]; then
     ARGS+=("--minirocket-ue-model" "models/minirocket_xapp_ue.joblib")
 fi
 
-# DQN model removed — this branch uses deterministic constraint execution.
-# The RL pipeline (DQN Proposer/Predictor/Actor) was replaced by the
-# ConstraintExecutor + LLM CognitiveAgent on the llm_planner branch.
-
 echo "=========================================="
 echo "Starting AI system on AMD ROCm Environment"
 echo "=========================================="

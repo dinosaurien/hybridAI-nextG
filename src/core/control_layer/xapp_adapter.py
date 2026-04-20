@@ -165,17 +165,21 @@ class XAppKPIAdapter:
             # Default to 100 RBs if total not available (common default)
             cell_metrics["PRB_Total_DL"] = 100.0
         
-        # Normalize and set cell_id
-        cell_id_raw = kpi_data.get("cellObjectID") or kpi_data.get("cell_id") or "CELL_001"
-        # Normalize cell_id: convert numeric strings to CELL_XXX format
-        if cell_id_raw and str(cell_id_raw).isdigit():
+        # Normalize cell_id. Preserve whatever the xApp actually reported —
+        # do not silently coerce missing/unknown values to CELL_001, since
+        # that masks multi-cell mis-routing (the real emitted id here is
+        # typically CELL_1111 for the single-cell ns-3 scenario).
+        cell_id_raw = kpi_data.get("cellObjectID") or kpi_data.get("cell_id")
+        if cell_id_raw is None or cell_id_raw == "":
+            cell_id = "unknown"
+        elif str(cell_id_raw).isdigit():
             cell_id = f"CELL_{cell_id_raw}"
-        elif cell_id_raw and cell_id_raw.startswith("CELL_"):
-            cell_id = cell_id_raw
-        elif cell_id_raw != "unknown":
-            cell_id = f"CELL_{cell_id_raw}" if not cell_id_raw.startswith("CELL_") else cell_id_raw
+        elif str(cell_id_raw).startswith("CELL_"):
+            cell_id = str(cell_id_raw)
+        elif cell_id_raw == "unknown":
+            cell_id = "unknown"
         else:
-            cell_id = "CELL_001"
+            cell_id = f"CELL_{cell_id_raw}"
         if "cell_id" not in cell_metrics:
             cell_metrics["cell_id"] = cell_id
         

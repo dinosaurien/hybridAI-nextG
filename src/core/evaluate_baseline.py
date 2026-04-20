@@ -5,7 +5,7 @@ Baseline Evaluation & Comparison Plotter
 Reads KPI data from kpms.csv (produced by xApp adapter) and generates
 evaluation plots for:
   1. Baseline (no AI actions) — vanilla ns-3 mmWave performance
-  2. AI-managed runs — with RL + LLM control loop active
+  2. AI-managed runs — with the LLM/KB/Reflexion control loop active
   3. Side-by-side comparison
 
 Usage:
@@ -717,77 +717,6 @@ def print_recovery_analysis(data: Dict, label: str):
               f"recovery={e['recovery_s']:.1f}s, peak={e['peak']:.1f}")
 
 
-# Training Loss Plot
-
-def plot_training_loss(loss_path: str, out_dir: str):
-    """Plot DQN training loss and reward curves from loss_history.json."""
-    import json
-    plt, _ = _import_plt()
-
-    with open(loss_path, "r") as f:
-        history = json.load(f)
-
-    if not history:
-        print("  Empty loss history, skipping")
-        return
-
-    steps = [e["step"] for e in history]
-    losses = [e["loss"] for e in history]
-    q_means = [e["q_mean"] for e in history]
-    reward_means = [e["reward_mean"] for e in history]
-    grad_norms = [e.get("grad_norm", 0) for e in history]
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("DQN Training Metrics", fontsize=14, fontweight="bold")
-
-    ax = axes[0][0]
-    ax.plot(steps, losses, linewidth=0.5, alpha=0.5, color="tab:red")
-    if len(losses) > 50:
-        w = min(100, len(losses) // 10)
-        avg = np.convolve(losses, np.ones(w)/w, mode="valid")
-        ax.plot(steps[w-1:], avg, linewidth=1.5, color="darkred", label=f"MA({w})")
-        ax.legend()
-    ax.set_ylabel("Huber Loss")
-    ax.set_title("Training Loss")
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[0][1]
-    ax.plot(steps, q_means, linewidth=0.5, alpha=0.5, color="tab:blue")
-    if len(q_means) > 50:
-        w = min(100, len(q_means) // 10)
-        avg = np.convolve(q_means, np.ones(w)/w, mode="valid")
-        ax.plot(steps[w-1:], avg, linewidth=1.5, color="darkblue", label=f"MA({w})")
-        ax.legend()
-    ax.set_ylabel("Mean Q-value")
-    ax.set_title("Q-Value Trajectory")
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[1][0]
-    ax.plot(steps, reward_means, linewidth=0.5, alpha=0.5, color="tab:green")
-    if len(reward_means) > 50:
-        w = min(100, len(reward_means) // 10)
-        avg = np.convolve(reward_means, np.ones(w)/w, mode="valid")
-        ax.plot(steps[w-1:], avg, linewidth=1.5, color="darkgreen", label=f"MA({w})")
-        ax.legend()
-    ax.set_ylabel("Mean Reward")
-    ax.set_title("Reward Trajectory")
-    ax.set_xlabel("Training Step")
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[1][1]
-    ax.plot(steps, grad_norms, linewidth=0.5, alpha=0.5, color="tab:purple")
-    ax.set_ylabel("Gradient Norm")
-    ax.set_title("Gradient Norm")
-    ax.set_xlabel("Training Step")
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    path = os.path.join(out_dir, "training_metrics.png")
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"  Saved: {path}")
-
-
 # Main
 
 def main():
@@ -807,9 +736,6 @@ Examples:
 
   # Compare two sessions from same CSV
   python evaluate_baseline.py --csv kpms.csv --baseline-session 2026-01-26 --managed-session 2026-02-17
-
-  # Also plot training loss
-  python evaluate_baseline.py --csv kpms.csv --session 2026-02-17 --loss-history models/loss_history.json
         """,
     )
 
@@ -821,7 +747,6 @@ Examples:
     parser.add_argument("--managed-session", type=str, help="AI-managed session date")
     parser.add_argument("--label", type=str, default="run", help="Label for single-dataset plots")
     parser.add_argument("--list-sessions", action="store_true", help="List available sessions and exit")
-    parser.add_argument("--loss-history", type=str, help="Path to loss_history.json for training plots")
     parser.add_argument("--out-dir", type=str, default="evaluation_plots", help="Output directory for plots")
 
     args = parser.parse_args()
@@ -895,11 +820,6 @@ Examples:
     else:
         parser.print_help()
         sys.exit(1)
-
-    # Training loss plots
-    if args.loss_history and os.path.exists(args.loss_history):
-        print("\nGenerating training metrics plots...")
-        plot_training_loss(args.loss_history, out_dir)
 
     print(f"\nAll plots saved to: {out_dir}/")
 

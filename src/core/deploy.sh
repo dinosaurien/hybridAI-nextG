@@ -44,22 +44,10 @@ if [ -f "models/minirocket_xapp_ue.joblib" ]; then
     ARGS+=("--minirocket-ue-model" "models/minirocket_xapp_ue.joblib")
 fi
 
-# Logic for DQN model: prefer online, fall back to offline
-if [ -f "models/qnet_online.pt" ]; then
-    ARGS+=("--dqn-model" "models/qnet_online.pt")
-    DQN_STATUS="models/qnet_online.pt"
-elif [ -f "models/qnet_offline.pt" ]; then
-    ARGS+=("--dqn-model" "models/qnet_offline.pt")
-    DQN_STATUS="models/qnet_offline.pt (fallback)"
-else
-    DQN_STATUS="Not found. Starting untrained."
-fi
-
 echo "=========================================="
 echo "Starting Core AI System via Poetry"
 echo "=========================================="
 echo "Mode          : $MODE"
-echo "DQN Model     : $DQN_STATUS"
 echo "xApp TCP Host : $HOST"
 echo "xApp TCP Port : $PORT"
 echo "Web UI Port   : $WEB_PORT"

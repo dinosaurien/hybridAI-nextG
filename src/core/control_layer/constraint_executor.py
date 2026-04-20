@@ -1,23 +1,19 @@
 """
 Objective-Aware Deterministic Constraint Executor.
 
-Replaces the RL pipeline (DQN Proposer → Predictor → Actor) with a fully
-deterministic, explainable actuation mechanism. Where the RL agent used the
-OTM objective as a reward signal and explored within constraint bounds, this
-executor uses domain heuristics to select the optimal operating point.
-
-The key insight: constraints define the FEASIBLE SET (e.g., MCS ∈ [0, 20]),
-and the objective determines WHERE within that set to operate:
+Deterministic, explainable actuation mechanism. Constraints define the
+FEASIBLE SET (e.g., MCS ∈ [0, 20]) and the objective determines WHERE
+within that set to operate:
   - "minimize latency" → lower MCS (fewer retransmissions), higher TX power
   - "maximize throughput" → higher MCS (more bits/symbol), higher TX power
 
-This is functionally equivalent to the RL agent's role but without stochastic
-exploration — every parameter choice is traceable to a heuristic rule.
+Every parameter choice is traceable to a heuristic rule.
 """
 
 import asyncio
 import time
 import logging
+from typing import Optional
 from core.bus.messages import make_msg
 from core.common.types import ControlAction, Playbook
 
@@ -134,7 +130,13 @@ class ConstraintExecutor:
 
             # Extract objective to drive parameter selection (deploy mode only)
             objective = otm.get("objective", {}) if self.objective_aware else {}
-            actions = self._constraints_to_actions(constraints, objective)
+
+            # Resolve the target cell from OTM metadata stamped by the
+            # orchestrator; fall back to default_cell_id only if unset.
+            meta = otm.get("metadata") or {}
+            target_cell = meta.get("cell_id") or self.default_cell_id
+
+            actions = self._constraints_to_actions(constraints, objective, target_cell)
 
             if not actions:
                 logger.debug("[CONSTRAINT_EXEC] No actuatable constraints in OTM, skipping.")
@@ -156,7 +158,8 @@ class ConstraintExecutor:
             ))
 
     def _constraints_to_actions(self, constraints: list,
-                                objective: dict) -> list:
+                                objective: dict,
+                                target_cell: Optional[str] = None) -> list:
         """Map OTM constraints to concrete E2 actions, biased by the objective.
 
         The objective determines the operating point within constraint bounds:
@@ -220,7 +223,7 @@ class ConstraintExecutor:
             action = ControlAction(
                 type=action_type,
                 scope="CELL",
-                cell_id=self.default_cell_id,
+                cell_id=target_cell or self.default_cell_id,
                 params={mapping["param_key"]: value},
             )
             actions.append(action)

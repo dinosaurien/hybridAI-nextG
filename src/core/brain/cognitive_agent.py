@@ -376,23 +376,59 @@ class CognitiveAgent:
             outcome = episode.get("outcome", {})
             otm = episode.get("otm_prescribed", {})
 
-            resolved_str = "RESOLVED" if outcome.get("resolved") else "FAILED"
+            # Canonical Reflexion: Msr is invoked when Me reports failure.
+            # The orchestrator already guards the publish on `resolved=False`,
+            # but we defend here too so a misrouted event does not waste tokens.
+            if outcome.get("resolved"):
+                logger.debug(f"[COGNITIVE] Skipping reflection for resolved episode "
+                             f"{(episode_id or '')[:8]}.")
+                continue
+
             metric = anomaly.get("metric", "unknown")
+            scope = anomaly.get("scope", {})
             val_before = anomaly.get("value", "?")
             val_after = outcome.get("metric_after", "?")
 
-            constraints_str = json.dumps(otm.get("constraints", []), indent=2) if otm.get("constraints") else "none"
+            constraints_str = (json.dumps(otm.get("constraints", []), indent=2)
+                               if otm.get("constraints") else "none")
             proc_id = otm.get("procedure_id", "none")
 
+            # Pull prior reflections for the same task so the new reflection
+            # builds on earlier analysis rather than repeating it
+            # (Shinn et al. §3: mem is fed into Msr as additional context).
+            prior_reflections_block = ""
+            if self.episode_store:
+                priors = self.episode_store.get_recent_reflections(anomaly)
+                if priors:
+                    prior_reflections_block = (
+                        "\nPrior reflections on this same task:\n"
+                        + "\n".join(f"  - {r}" for r in priors)
+                        + "\n"
+                    )
+
+            # Canonical Reflexion prompt, adapted from the authors' reference
+            # implementation (hotpotqa_runs/prompts.py "reflect_prompt"),
+            # grounded in this project's two-actuator control space so the
+            # LLM cannot hallucinate out-of-scope recommendations.
             reflect_prompt = (
-                f"Analyze this network management episode:\n"
-                f"- Metric: {metric}\n"
-                f"- Value before: {val_before}, after: {val_after}\n"
-                f"- Outcome: {resolved_str}\n"
-                f"- Procedure used: {proc_id}\n"
-                f"- Constraints applied: {constraints_str}\n\n"
-                f"Explain WHY this outcome occurred and WHAT should be done differently next time "
-                f"(or what to repeat if it worked). Be specific to the parameter values."
+                f"You are a 5G network-management AI that improves itself by "
+                f"self-reflecting on failed trials.\n\n"
+                f"You were given an anomaly and your prescribed OTM FAILED to resolve it.\n\n"
+                f"Task: metric={metric}, scope={scope}.\n"
+                f"Trajectory:\n"
+                f"  1. Observed anomaly: {metric} = {val_before}.\n"
+                f"  2. Applied OTM procedure '{proc_id}' with constraints:\n"
+                f"     {constraints_str}\n"
+                f"  3. After execution, {metric} = {val_after} — still out of bounds.\n"
+                f"{prior_reflections_block}\n"
+                f"ACTION SPACE (the ONLY knobs this system exposes):\n"
+                f"  - dl_mcs_max   : integer 0-28 (downlink MCS cap)\n"
+                f"  - tx_power_dbm : number 30-60 (base-station transmit power, dBm)\n"
+                f"Do NOT suggest scheduler changes, beamforming, handover tuning, "
+                f"QoS class changes, or any other mechanism — they are not actuatable.\n\n"
+                f"In 2-4 complete sentences, diagnose a plausible reason the trial failed "
+                f"and propose a concrete, high-level plan phrased in terms of dl_mcs_max "
+                f"and/or tx_power_dbm that should avoid the same failure next time."
             )
 
             loop = asyncio.get_running_loop()
@@ -429,18 +465,21 @@ class CognitiveAgent:
                 kb_recommendations = self.kb.query_scenario(metric)
                 rec_str = json.dumps(kb_recommendations) if kb_recommendations else "None."
 
-                # RAG from episodic memory — retrieve similar past experiences
+                # Reflexion tail-take: last Omega reflections for THIS task
+                # (metric, cell_id). No embedding similarity — see Shinn et
+                # al. 2023 Algorithm 1 and episode_store.ReflexionMemory.
                 experience_block = ""
                 if self.episode_store:
-                    episodes = self.episode_store.retrieve(
-                        {"metric": metric, "value": val}, k=3
-                    )
-                    if episodes:
+                    anomaly_ctx = {
+                        "metric": metric,
+                        "value": val,
+                        "scope": payload.get("scope") or {"cell_id": "CELL_001"},
+                    }
+                    reflections = self.episode_store.get_recent_reflections(anomaly_ctx)
+                    if reflections:
                         experience_block = (
-                            f"\nPAST EXPERIENCE (similar situations and their outcomes):\n"
-                            f"{self.episode_store.format_for_prompt(episodes)}\n\n"
-                            f"Use these past experiences to inform your decision. "
-                            f"Prefer strategies that RESOLVED the issue. Avoid strategies that FAILED.\n"
+                            f"\n{self.episode_store.format_reflections_for_prompt(reflections)}\n"
+                            f"Use these prior reflections to avoid repeating past failures.\n\n"
                         )
 
                 prompt = (
@@ -518,17 +557,22 @@ class CognitiveAgent:
                 prev_otm = payload.get("previous_otm")
                 val = payload.get("value")
 
-                # RAG from episodic memory — retrieve similar past adaptations
+                # Reflexion tail-take for adaptation path (same task scoping
+                # as generate_otm). The reflections were written after the
+                # previous trial of this same (metric, cell_id) failed, which
+                # is precisely when they are most relevant.
                 experience_block = ""
                 if self.episode_store:
-                    episodes = self.episode_store.retrieve(
-                        {"metric": metric, "value": val}, k=3
-                    )
-                    if episodes:
+                    anomaly_ctx = {
+                        "metric": metric,
+                        "value": val,
+                        "scope": payload.get("scope") or {"cell_id": "CELL_001"},
+                    }
+                    reflections = self.episode_store.get_recent_reflections(anomaly_ctx)
+                    if reflections:
                         experience_block = (
-                            f"\nPAST EXPERIENCE (similar adaptations and their outcomes):\n"
-                            f"{self.episode_store.format_for_prompt(episodes)}\n\n"
-                            f"Learn from these past adaptations. Repeat what RESOLVED the issue. Avoid what FAILED.\n"
+                            f"\n{self.episode_store.format_reflections_for_prompt(reflections)}\n"
+                            f"Apply these reflections to pick a different adjustment this time.\n\n"
                         )
 
                 # Show APPLIED values (what actually went to ns-3), not just thresholds.
@@ -578,22 +622,40 @@ class CognitiveAgent:
                 )
 
             # Merge: anomaly arrived while a user/proactive OTM was active
-            # Merge: anomaly arrived while a user/proactive OTM was active
             elif payload.get("type") == "merge_otm":
                 active_otm = payload.get("active_otm", {})
                 anomaly = payload.get("anomaly", {})
                 anomaly_metric = anomaly.get("metric", "unknown")
                 anomaly_value = anomaly.get("value", "unknown")
-                
+
                 # Fetch procedures for the new anomaly
                 kb_recommendations = self.kb.query_scenario(anomaly_metric)
                 rec_str = json.dumps(kb_recommendations) if kb_recommendations else "None."
+
+                # Reflexion tail-take on the incoming anomaly's task — same
+                # semantics as generate_otm/adapt_otm. Merging is still a
+                # reactive response to the anomaly; prior reflections on
+                # this (metric, cell_id) are just as relevant.
+                experience_block = ""
+                if self.episode_store:
+                    anomaly_ctx = {
+                        "metric": anomaly_metric,
+                        "value": anomaly_value,
+                        "scope": anomaly.get("scope") or {"cell_id": "CELL_001"},
+                    }
+                    reflections = self.episode_store.get_recent_reflections(anomaly_ctx)
+                    if reflections:
+                        experience_block = (
+                            f"\n{self.episode_store.format_reflections_for_prompt(reflections)}\n"
+                            f"Use these reflections when choosing the constraints added for the new anomaly.\n\n"
+                        )
 
                 prompt = (
                     f"MERGE REQUEST: A network anomaly has occurred on '{anomaly_metric}' "
                     f"(current value: {anomaly_value}) while the following OTM is active:\n"
                     f"{json.dumps(active_otm)}\n\n"
                     f"KNOWLEDGE BASE PROCEDURES FOR NEW ANOMALY: {rec_str}\n\n"
+                    f"{experience_block}"
                     f"TASK: Generate a MERGED OTM JSON that handles both the active OTM and the new anomaly.\n"
                     f"1. PRESERVE the original objective and existing actuatable constraints from the active OTM if possible.\n"
                     f"2. Add NEW actuatable constraints (dl_mcs_max, tx_power_dbm) to address the '{anomaly_metric}' anomaly, using the Knowledge Base procedures as a guide.\n"
