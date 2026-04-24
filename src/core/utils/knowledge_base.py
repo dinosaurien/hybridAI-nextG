@@ -81,10 +81,10 @@ PROCEDURE_CATALOG: Dict[str, dict] = {
                                             "threshold": 48.0, "unit": "dBm", "id": "PROC_TXPOW"}]},
                           ns3_capable=True),
             ProcedureStep(2, "verify_final_congestion", "Verify final latency",
-                          None, ns3_capable=True,
-                          health_check={"checks": [
-                              {"metric": "DRB_PdcpSduDelayDl", "operator": "le", "threshold": 60.0},
-                          ]}),
+                  None, ns3_capable=True,
+                  health_check={"checks": [
+                      {"metric": "DRB_PdcpSduDelayDl", "operator": "le", "threshold": 7.0},
+                  ]}),
         ],
     },
 
@@ -105,7 +105,7 @@ PROCEDURE_CATALOG: Dict[str, dict] = {
             ProcedureStep(2, "verify_readiness", "Verify network stability before surge",
                           None, ns3_capable=True,
                           health_check={"checks": [
-                              {"metric": "DRB_PdcpSduDelayDl", "operator": "le", "threshold": 50.0},
+                              {"metric": "DRB_PdcpSduDelayDl", "operator": "le", "threshold": 7.0},
                               {"metric": "UE_DRB_BlerDl_UEID", "operator": "le", "threshold": 0.05},
                           ]}),
         ],
@@ -144,7 +144,7 @@ class KnowledgeBase:
     # Defaults used when a cell has no override registered.
     DEFAULT_HEALTH_THRESHOLDS: Dict[str, float] = {
         "latency_max_ms": 50.0,
-        "throughput_min_mbps": 5.0,
+        "throughput_min_mbps": 10.0,
         "bler_max": 0.1,
     }
 
@@ -199,8 +199,9 @@ class KnowledgeBase:
 
         thr_steps = [
             "DIAGNOSIS: Network is experiencing Low Downlink Throughput.",
-            "ACTION: Increase resource allocation and modulation order.",
+            "ACTION: Maximize transmit power to support high-order modulation.",
             "OTM_INSTRUCTION: Set an objective to maximize throughput (UE_DRB_UEThpDl_UEID).",
+            "IMPORTANT DOMAIN KNOWLEDGE: To achieve peak throughput (e.g., 20+ Mbps), you must maintain a high modulation order. If throughput is low, DO NOT immediately drop the MCS. Instead, maximize `tx_power_dbm` (up to 60.0) to improve the signal-to-noise ratio so the channel can support high MCS. Maintain `dl_mcs_max` >= 24 to allow adaptive high-speed scheduling.",
             "OTM_INSTRUCTION: Leave the 'constraints' array empty. The orchestrator will inject actuatable constraints from the procedure catalog."
         ]
         for i, step in enumerate(thr_steps):

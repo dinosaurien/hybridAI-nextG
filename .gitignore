@@ -9,9 +9,20 @@ __pycache__/
 
 poetry.lock
 models/
+logs/
 kpms/
 evaluation_plots/
 data/
 playbooks/
 kpms.csv
 src/core/utils/install_rule.http
+baseline1.csv
+baseline2.csv
+baseline3.csv
+baseline4.csv
+baseline5.csv
+no_reflexion1.csv
+no_reflexion2.csv
+no_reflexion3.csv
+no_reflexion4.csv
+no_reflexion5.csv

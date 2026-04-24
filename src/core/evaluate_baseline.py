@@ -540,34 +540,37 @@ def plot_single_dataset(data: Dict, label: str, out_dir: str):
         print(f"  Saved: {path}")
 
 
-def plot_comparison(baseline: Dict, managed: Dict, out_dir: str):
-    """Generate side-by-side comparison plots."""
+def plot_comparison(datasets: List[Tuple[Dict, str, str]], out_dir: str):
+    """Generate side-by-side comparison plots for multiple datasets."""
     plt, _ = _import_plt()
     os.makedirs(out_dir, exist_ok=True)
 
     # Summary statistics comparison
-    b_stats = compute_summary_stats(baseline)
-    m_stats = compute_summary_stats(managed)
-
-    print("\n" + "=" * 65)
-    print(f"{'Metric':<35} {'Baseline':>12} {'AI-Managed':>12}")
-    print("=" * 65)
-    all_keys = sorted(set(list(b_stats.keys()) + list(m_stats.keys())))
+    print("\n" + "=" * 85)
+    header = f"{'Metric':<35}" + "".join([f"{label:>15}" for _, label, _ in datasets])
+    print(header)
+    print("=" * 85)
+    
+    all_stats = [compute_summary_stats(d) for d, _, _ in datasets]
+    all_keys = sorted(set().union(*(s.keys() for s in all_stats)))
+    
     for key in all_keys:
-        bv = b_stats.get(key)
-        mv = m_stats.get(key)
-        bs = f"{bv:.2f}" if bv is not None else "N/A"
-        ms = f"{mv:.2f}" if mv is not None else "N/A"
-        print(f"{key:<35} {bs:>12} {ms:>12}")
-    print("=" * 65)
+        row_str = f"{key:<35}"
+        for stats in all_stats:
+            val = stats.get(key)
+            val_str = f"{val:.2f}" if val is not None else "N/A"
+            row_str += f"{val_str:>15}"
+        print(row_str)
+    print("=" * 85)
 
-    # Latency comparison
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("Baseline vs AI-Managed Comparison", fontsize=14, fontweight="bold")
+    # Comparison Plots
+    fig, axes = plt.subplots(4, 1, figsize=(16, 13)) # Increased to 4 subplots and taller figure
+    title_labels = " vs ".join([label for _, label, _ in datasets])
+    fig.suptitle(f"Performance Comparison: {title_labels}", fontsize=14, fontweight="bold")
 
     # Latency time series
-    ax = axes[0][0]
-    for dataset, label, color in [(baseline, "Baseline", "tab:red"), (managed, "AI-Managed", "tab:blue")]:
+    ax = axes[0]
+    for dataset, label, color in datasets:
         ts, vals = extract_timeseries(dataset, "DRB_PdcpSduDelayDl", "cell")
         mins = _relative_minutes(ts)
         if mins and len(vals) > 20:
@@ -579,24 +582,9 @@ def plot_comparison(baseline: Dict, managed: Dict, out_dir: str):
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Latency CDF
-    ax = axes[0][1]
-    for dataset, label, color in [(baseline, "Baseline", "tab:red"), (managed, "AI-Managed", "tab:blue")]:
-        _, vals = extract_timeseries(dataset, "DRB_PdcpSduDelayDl", "cell")
-        if vals:
-            sorted_v = np.sort(vals)
-            cdf = np.arange(1, len(sorted_v) + 1) / len(sorted_v)
-            ax.plot(sorted_v, cdf, linewidth=1.5, color=color, label=label)
-    ax.set_xlabel("DL Latency (ms)")
-    ax.set_ylabel("CDF")
-    ax.set_title("Latency CDF")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
     # Aggregate throughput
-    ax = axes[1][0]
-    for dataset, label, color in [(baseline, "Baseline", "tab:red"), (managed, "AI-Managed", "tab:blue")]:
-        # Sum throughput across all UEs at each timestamp
+    ax = axes[1]
+    for dataset, label, color in datasets:
         all_thp = defaultdict(float)
         for ue_id in dataset["ue"]:
             for row in dataset["ue"][ue_id]:
@@ -612,16 +600,15 @@ def plot_comparison(baseline: Dict, managed: Dict, out_dir: str):
                 ax.plot(mins[window-1:], avg, linewidth=1.5, color=color, label=label)
     ax.set_ylabel("Aggregate Throughput (kbps)")
     ax.set_title("Total DL Throughput (rolling avg)")
-    ax.set_xlabel("Time (minutes)")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
     # MCS distribution bar chart
-    ax = axes[1][1]
-    width = 0.35
+    ax = axes[2]
+    width = 0.8 / len(datasets)
     x = np.arange(3)
     labels = ["QPSK", "16QAM", "64QAM"]
-    for i, (dataset, label, color) in enumerate([(baseline, "Baseline", "tab:red"), (managed, "AI-Managed", "tab:blue")]):
+    for i, (dataset, label, color) in enumerate(datasets):
         _, mcs_labels = compute_mcs_from_tb(dataset)
         if mcs_labels:
             from collections import Counter
@@ -630,16 +617,38 @@ def plot_comparison(baseline: Dict, managed: Dict, out_dir: str):
             pcts = [100.0 * counts.get(m, 0) / total for m in labels]
         else:
             pcts = [0, 0, 0]
-        ax.bar(x + i * width, pcts, width, label=label, color=color, alpha=0.7)
-    ax.set_xticks(x + width / 2)
+        ax.bar(x + (i * width) - (width * len(datasets)/2) + (width/2), pcts, width, label=label, color=color, alpha=0.7)
+    ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.set_ylabel("% of samples")
-    ax.set_title("MCS Distribution")
+    ax.set_title("MCS Distribution Summary")
     ax.legend()
     ax.grid(True, alpha=0.3, axis="y")
 
+    # MCS Time Series Scatter Plot
+    ax = axes[3]
+    mcs_map = {"QPSK": 0, "16QAM": 1, "64QAM": 2}
+    
+    for i, (dataset, label, color) in enumerate(datasets):
+        ts_mcs, mcs_labels = compute_mcs_from_tb(dataset)
+        if ts_mcs:
+            mins_mcs = _relative_minutes(ts_mcs)
+            # Add a slight vertical offset so datasets don't perfectly overlap
+            offset = (i - (len(datasets) - 1) / 2) * 0.15 
+            mcs_nums = [mcs_map.get(m, -1) + offset for m in mcs_labels]
+            
+            ax.scatter(mins_mcs, mcs_nums, s=6, alpha=0.6, color=color, label=label)
+
+    ax.set_yticks([0, 1, 2])
+    ax.set_yticklabels(["QPSK", "16QAM", "64QAM"])
+    ax.set_ylabel("Dominant Modulation")
+    ax.set_title("MCS / Modulation Over Time")
+    ax.set_xlabel("Time (minutes)")
+    ax.legend(markerscale=3) # Scale up legend markers so they are visible
+    ax.grid(True, alpha=0.3)
+
     plt.tight_layout()
-    path = os.path.join(out_dir, "comparison.png")
+    path = os.path.join(out_dir, "comparison_3way.png") # Adjust filename if necessary depending on your 2-way vs 3-way logic
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  Saved: {path}")
@@ -742,12 +751,14 @@ Examples:
     parser.add_argument("--csv", type=str, help="Single kpms.csv file to analyze")
     parser.add_argument("--baseline", type=str, help="Baseline CSV file path")
     parser.add_argument("--managed", type=str, help="AI-managed CSV file path")
+    parser.add_argument("--reflexion", type=str, help="AI with Reflexion CSV file path")
     parser.add_argument("--session", type=str, help="Filter by date (YYYY-MM-DD)")
     parser.add_argument("--baseline-session", type=str, help="Baseline session date")
     parser.add_argument("--managed-session", type=str, help="AI-managed session date")
     parser.add_argument("--label", type=str, default="run", help="Label for single-dataset plots")
     parser.add_argument("--list-sessions", action="store_true", help="List available sessions and exit")
     parser.add_argument("--out-dir", type=str, default="evaluation_plots", help="Output directory for plots")
+    
 
     args = parser.parse_args()
 
@@ -763,8 +774,49 @@ Examples:
     out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
 
+    # 3-Way Comparison mode
+    if args.baseline and args.managed and args.reflexion:
+        print(f"Loading baseline: {args.baseline}")
+        b_data = load_kpms_csv(args.baseline)
+        
+        print(f"Loading AI (No Reflexion): {args.managed}")
+        m_data = load_kpms_csv(args.managed)
+
+        print(f"Loading AI (With Reflexion): {args.reflexion}")
+        r_data = load_kpms_csv(args.reflexion)
+
+        print("\nGenerating plots...")
+        datasets = [
+            (b_data, "Baseline", "tab:red"),
+            (m_data, "AI (No Reflexion)", "tab:blue"),
+            (r_data, "AI (Reflexion)", "tab:green")
+        ]
+        
+        plot_comparison(datasets, out_dir)
+        print_recovery_analysis(b_data, "Baseline")
+        print_recovery_analysis(m_data, "AI (No Reflexion)")
+        print_recovery_analysis(r_data, "AI (With Reflexion)")
+
+    # 2-Way Comparison mode (AI vs Reflexion without Baseline)
+    elif args.managed and args.reflexion and not args.baseline:
+        print(f"Loading AI (No Reflexion): {args.managed}")
+        m_data = load_kpms_csv(args.managed)
+
+        print(f"Loading AI (With Reflexion): {args.reflexion}")
+        r_data = load_kpms_csv(args.reflexion)
+
+        print("\nGenerating plots...")
+        datasets = [
+            (m_data, "AI (No Reflexion)", "tab:blue"),
+            (r_data, "AI (Reflexion)", "tab:green")
+        ]
+        
+        plot_comparison(datasets, out_dir)
+        print_recovery_analysis(m_data, "AI (No Reflexion)")
+        print_recovery_analysis(r_data, "AI (With Reflexion)")
+
     # Comparison mode: two separate files
-    if args.baseline and args.managed:
+    elif args.baseline and args.managed:
         print(f"Loading baseline: {args.baseline}")
         b_data = load_kpms_csv(args.baseline)
         print(f"  → {len(b_data['cell'])} cell rows, {sum(len(v) for v in b_data['ue'].values())} UE rows")

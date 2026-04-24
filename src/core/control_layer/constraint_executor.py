@@ -13,7 +13,7 @@ Every parameter choice is traceable to a heuristic rule.
 import asyncio
 import time
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 from core.bus.messages import make_msg
 from core.common.types import ControlAction, Playbook
 
@@ -104,11 +104,24 @@ class ConstraintExecutor:
     MIN_ACTION_INTERVAL = 5.0  # seconds, matches previous RL observer's rate limit
 
     def __init__(self, bus, default_cell_id: str = "CELL_001",
-                 objective_aware: bool = True):
+                 objective_aware: bool = True,
+                 allow_adaptive_mcs: bool = True):
         self.bus = bus
         self.default_cell_id = default_cell_id
         self.objective_aware = objective_aware
+        # When False, the `ge`/`gt` dl_mcs_max → mcs=-1 escape hatch is
+        # disabled and the executor dispatches a concrete integer instead.
+        # Used in evaluation mode: ns-3's in-scheduler AMC (mcs=-1) regulates
+        # the channel perfectly and the LLM never sees failed episodes, which
+        # starves Reflexion of material to reflect on. Forcing specific MCS
+        # values makes the LLM's choice evaluable.
+        self.allow_adaptive_mcs = allow_adaptive_mcs
         self._last_dispatch_time = 0.0
+        # Idempotency: track the last value dispatched per (action_type, cell)
+        # so successive OTMs that compute the same operating point don't
+        # re-send E2 commands — the extra churn was observed to re-trigger
+        # MiniRocket after actuator state settled.
+        self._last_dispatched: Dict[Tuple[str, str], Any] = {}
 
     async def run(self):
         q_intent = await self.bus.sub("intent.current")
@@ -196,34 +209,80 @@ class ConstraintExecutor:
             operator = c.get("operator", "le")
             lo, hi = mapping["clamp"]
 
-            # Skip objective biasing for procedure-step constraints —
-            # these are expert-verified values from the KB and should be
-            # applied exactly as specified (Fix #4).
-            is_procedure_constraint = c.get("origin") == "procedure_step"
+            is_llm_adapted = (
+                c.get("adapted_by") == "cognitive_llm" or 
+                c.get("origin") == "cognitive_llm"
+            )
+            is_procedure_constraint = (c.get("origin") == "procedure_step")
 
-            if is_procedure_constraint:
-                direction = "neutral"
-                bias = 0.0
-            else:
+            if is_procedure_constraint and not is_llm_adapted:
+                # Apply heuristic bias ONLY for default procedure steps
                 param_profile = profile.get(kpi, {"direction": "neutral", "bias": 0.0})
                 direction = param_profile["direction"]
                 bias = param_profile["bias"]
+            else:
+                # It came from the LLM. Apply EXACTLY what it asked for.
+                direction = "neutral"
+                bias = 0.0
 
-            # Compute the objective-biased operating point
-            value = self._compute_biased_value(
-                raw_threshold, operator, lo, hi, direction, bias
+            # Adaptive-MCS escape hatch: ns-3's set-mcs PINS MCS to the
+            # supplied value (see eval_scenario.cc ChangeMcs — FixedMcsDl
+            # is toggled on). For a `ge` constraint on dl_mcs_max under a
+            # throughput-maximising objective, pinning at the threshold
+            # would cap the scheduler at the floor, which is the opposite
+            # of the expert intent ("allow MCS at least this high"). Dispatch
+            # mcs=-1 instead — the scenario's else-branch disables FixedMcs
+            # and restores adaptive scheduling.
+            #
+            # Gated by allow_adaptive_mcs: evaluation mode disables it so the
+            # LLM is forced to pick a concrete integer (otherwise ns-3's AMC
+            # trivially handles everything and Reflexion has no failures to
+            # learn from).
+            obj_direction = (_OBJECTIVE_PROFILES.get(obj_kpi, {}).get(kpi, {}).get("direction"))
+
+            use_adaptive_mcs = (
+                self.allow_adaptive_mcs
+                and kpi == "dl_mcs_max"
+                and obj_direction == "high"
+                and raw_threshold >= 24  # Catch LLM attempting to max out MCS
             )
-            value = mapping["cast"](max(lo, min(hi, value)))
+
+            if use_adaptive_mcs:
+                value = -1  # ns-3 sentinel: disable FixedMcs, use adaptive
+                logger.info(
+                    f"[CONSTRAINT_EXEC] {kpi} {operator} {raw_threshold} under "
+                    f"objective '{obj_kpi}' → dispatching adaptive MCS (mcs=-1) "
+                    f"to prevent hard-pinning packet loss."
+                )
+            else:
+                # Compute the objective-biased operating point
+                value = self._compute_biased_value(
+                    raw_threshold, operator, lo, hi, direction, bias
+                )
+                value = mapping["cast"](max(lo, min(hi, value)))
 
             # Write applied_value back into the constraint for traceability.
             # This is critical: adaptation prompts and episode recording must
             # know what was actually sent to ns-3, not just the threshold.
             c["applied_value"] = value
 
+            # Idempotency: suppress dispatch if this (action_type, cell) pair
+            # is already at the computed value. Prevents actuator churn on
+            # successive OTMs that settle on the same operating point.
+            cell_key = target_cell or self.default_cell_id
+            dispatch_key = (action_type, cell_key)
+            if self._last_dispatched.get(dispatch_key) == value:
+                logger.info(
+                    f"[CONSTRAINT_EXEC] {kpi}={value}: unchanged from last "
+                    f"dispatch, skipping."
+                )
+                continue
+            self._last_dispatched[dispatch_key] = value
+
             action = ControlAction(
                 type=action_type,
                 scope="CELL",
-                cell_id=target_cell or self.default_cell_id,
+                cell_id=cell_key,
                 params={mapping["param_key"]: value},
             )
             actions.append(action)
@@ -234,6 +293,11 @@ class ConstraintExecutor:
                     f"[CONSTRAINT_EXEC] {kpi}: threshold={raw_threshold} "
                     f"({operator}), objective bias '{direction}' "
                     f"(bias={bias:.1f}) → applied value={value}"
+                )
+            elif is_llm_adapted:
+                logger.info(
+                    f"[CONSTRAINT_EXEC] {kpi}: threshold={raw_threshold} "
+                    f"(LLM tuned, bypassing heuristic bias) → applied value={value}"
                 )
             elif is_procedure_constraint:
                 logger.info(

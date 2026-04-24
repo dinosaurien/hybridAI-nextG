@@ -30,14 +30,7 @@ Deploy with the default mode (`deploy`):
 ./src/core/deploy.sh
 ```
 
-Train the DQN agent:
-(This requires the seperate ns3 simulator to run in parallell)
-
-```bash
-MODE=train ./src/core/deploy.sh
-```
-
-Run a baseline measurement (no AI actions):
+Run for a baseline measurement (no AI actions, outputs simulated data to csv file):
 
 ```bash
 MODE=baseline ./src/core/deploy.sh
@@ -72,8 +65,6 @@ The `deploy_amd.sh` was made specifically for Dino's hardware setup
 
 Place models in the `models/` directory. The deploy script auto-detects them:
 
-- `models/qnet_online.pt` — DQN checkpoint (preferred)
-- `models/qnet_offline.pt` — DQN fallback
 - `models/minirocket_xapp_gnb.joblib` — gNB anomaly detector
 - `models/minirocket_xapp_ue.joblib` — UE anomaly detector
 
@@ -82,8 +73,8 @@ Place models in the `models/` directory. The deploy script auto-detects them:
 Train anomaly detection models from collected KPI data (`kpms.csv`):
 
 ```bash
-# Train both gNB and UE models (default)
-poetry run train_minirocket_xapp
+# Train both gNB and UE models (default) (See the file in question for information about its flags)
+poetry run src/core/train_minirocket_xapp.py
 
 # Train on a single metric
 poetry run train_minirocket_xapp --metric DRB_PdcpSduDelayDl
