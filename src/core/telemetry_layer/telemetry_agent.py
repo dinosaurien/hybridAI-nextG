@@ -73,8 +73,10 @@ class DeviationMonitor:
             # Reset deviation state after enough consecutive normal readings
             if self.consecutive_normal >= self.min_deviation_count and self.in_deviation_state:
                 self.in_deviation_state = False
-                logger.info(f"[DEVIATION] {self.entity_id}: Conditions returned to normal "
-                            f"({self.consecutive_normal} consecutive normal readings)")
+                logger.info(f"[DEVIATION] {self.entity_id}: Conditions returned to normal...")
+                
+                # Tell the bus the anomaly is gone so orchestrator can know.
+                return {"metric": self.metric, "status": "cleared", "entity_id": self.entity_id}
             return None
 
         # Is deviation — reset normal counter
@@ -115,8 +117,8 @@ class DeviationMonitor:
              elif value > 50: severity = "high"
         
         # State target/baseline explicitly so the LLM gets mathematical context for its OTMs
-        # 40.0ms for Latency/Delay, 50,000,000 bps (50 Mbps) for Throughput
-        target = 40.0 if direction == "lower_better" else 50000000.0
+        # 40.0ms for Latency/Delay, 50_000 kbps (50 Mbps) for Throughput
+        target = 40.0 if direction == "lower_better" else 50000.0
         baseline = target
         
         scope = {
@@ -146,7 +148,7 @@ class TelemetryAgent:
     
     def __init__(self, bus, model_path: str = "models/minirocket.joblib", 
                  window_size: int = 128, metric: str = "delay_p95_ms",
-                 debounce_seconds: float = 5.0, min_deviation_count: int = 3):
+                 debounce_seconds: float = 5.0, min_deviation_count: int = 6):
         
         self.bus = bus
         self.model_path = model_path

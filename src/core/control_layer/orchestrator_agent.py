@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import statistics
 import time
 import logging
 import uuid as _uuid
@@ -19,12 +20,14 @@ logger = logging.getLogger(__name__)
 class IntentState(Enum):
     MONITORING = auto()
     THINKING = auto()
+    REFLECTING = auto() # To avoid race condition, want to ensure the reflection has been made and stored before next adaptation call
     ASSURANCE = auto()  # 30s grace period for constraint executor to apply actions
     WITHDRAWAL = auto() # Evaluate whether the OTM resolved the deviation
     ESCALATED = auto()  # System frozen after repeated failures — awaiting human intervention
 
 class OrchestratorAgent:
-    THINKING_TIMEOUT = 75.0   # seconds before assuming LLM failed
+    THINKING_TIMEOUT = 15.0   # seconds before assuming LLM failed to infer
+    REFLECTION_TIMEOUT = 10.0 # Seconds before assuming that the reflection process has failed to infer.
     WITHDRAWAL_WINDOW = 10.0  # seconds to evaluate post-assurance telemetry
     MAX_ADAPTATION_CYCLES = 5  # cap adaptation loops before declaring failure
     ESCALATED_TIMEOUT = 300.0  # seconds before auto-unlocking ESCALATED state
@@ -35,9 +38,13 @@ class OrchestratorAgent:
         self.kb = kb
         self.episode_store = episode_store
         self.state = IntentState.MONITORING
+
         self.thinking_start_time = 0.0
+        self.reflecting_start_time = 0.0
         self.assurance_end_time = 0.0
         self.withdrawal_end_time = 0.0
+
+        self.pending_adapt_context = None
         self.active_otm = None
         self.active_anomaly_metric = None
         self.active_cell_id: Optional[str] = None  # Cell scope of the current anomaly
@@ -81,8 +88,9 @@ class OrchestratorAgent:
         q_cmd = await self.bus.sub("command.notify")
         q_kpi = await self.bus.sub("kpi.raw")
         q_cancel = await self.bus.sub("schedule.cancel")
+        q_reflect_done = await self.bus.sub("ai.reflection_done")
 
-        logger.info("[ORCHESTRATOR] Orchestrator Online. Monitoring for Anomalies & Manual Intents.")
+        logger.info("[ORCHESTRATOR] Online")
 
         while True:
             current_time = time.time()
@@ -130,6 +138,35 @@ class OrchestratorAgent:
                 logger.warning("[ORCHESTRATOR] THINKING timeout reached — Cognitive Core did not respond. Returning to MONITORING.")
                 self._clear_anomaly_state()
                 self.state = IntentState.MONITORING
+            
+            # Reflection timeout handling
+            if self.state == IntentState.REFLECTING and current_time >= self.reflecting_start_time + (self.THINKING_TIMEOUT * 2):
+                logger.warning("[ORCHESTRATOR] REFLECTING timeout reached. Resuming AI Adaptation without reflection.")
+                self.state = IntentState.THINKING
+                self.thinking_start_time = current_time
+                self.e2_acks_received = 0
+                if self.pending_adapt_context:
+                    await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
+                        "type": "adapt_otm", **self.pending_adapt_context
+                    }))
+                    self.pending_adapt_context = None
+
+            # Unblock state machine when Reflection is successfully finished
+            while not q_reflect_done.empty():
+                q_reflect_done.get_nowait()
+                if self.state == IntentState.REFLECTING:
+                    logger.info("[ORCHESTRATOR] Reflexion phase complete. Proceeding to AI Adaptation.")
+                    self.state = IntentState.THINKING
+                    self.thinking_start_time = current_time
+                    self.e2_acks_received = 0
+                    
+                    # Fire off the adapt_otm request we saved before pausing
+                    if self.pending_adapt_context:
+                        await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
+                            "type": "adapt_otm", **self.pending_adapt_context
+                        }))
+                        self.pending_adapt_context = None
+
 
             # ESCALATED auto-unlock: don't stay frozen forever if no human intervenes
             if self.state == IntentState.ESCALATED and current_time >= self.escalated_at + self.ESCALATED_TIMEOUT:
@@ -143,7 +180,13 @@ class OrchestratorAgent:
                 if self.e2_acks_received == 0 and not (
                     self.active_procedure and self.active_procedure.state == ProcedureState.ACTIVE
                 ):
-                    logger.warning("[ORCHESTRATOR] Assurance expired but NO E2 commands were dispatched. Returning to MONITORING.")
+                    logger.warning("[ORCHESTRATOR] Assurance expired but NO E2 commands were dispatched. "
+                                   "Dropping unapplied OTM and returning to MONITORING.")
+                    # Drop the ghost OTM: it never executed, so the next anomaly
+                    # on the same metric must be treated as fresh (generate_otm),
+                    # not as a "persistent failure" of a non-existent intervention.
+                    self.active_otm = None
+                    self._clear_anomaly_state()
                     self.state = IntentState.MONITORING
                 else:
                     logger.info(f"[ORCHESTRATOR] Assurance expired ({self.e2_acks_received} E2 commands dispatched). Entering WITHDRAWAL to evaluate outcome.")
@@ -154,60 +197,55 @@ class OrchestratorAgent:
             if self.state == IntentState.WITHDRAWAL and current_time >= self.withdrawal_end_time:
                 resolved = await self._evaluate_withdrawal()
                 if resolved:
-                    self.adaptation_cycle_count = 0  # Reset on success
-                    # If a procedure is active, advance to the next step instead of MONITORING
+                    self.adaptation_cycle_count = 0
                     if self.active_procedure and self.active_procedure.state == ProcedureState.ACTIVE:
-                        self.active_procedure.step_failures = 0
                         advanced = await self._advance_procedure()
                         if not advanced:
-                            # No more steps — procedure complete. Record final episode.
                             await self._record_and_reflect(resolved=True)
                             await self._complete_procedure()
                             await self._release_anomaly_otm_if_needed()
                             self._clear_anomaly_state()
                             self.state = IntentState.MONITORING
-                        # else: intermediate step — _advance_procedure set state to ASSURANCE, no episode yet
                     else:
-                        # No procedure — simple anomaly→OTM→resolved cycle. Record episode.
                         await self._record_and_reflect(resolved=True)
-                        logger.info("[ORCHESTRATOR] WITHDRAWAL: Deviation resolved. Returning to MONITORING.")
                         await self._release_anomaly_otm_if_needed()
                         self._clear_anomaly_state()
                         self.state = IntentState.MONITORING
                 else:
-                    # Check procedure step failure limit
                     if self.active_procedure and self.active_procedure.state == ProcedureState.ACTIVE:
-                        self.active_procedure.step_failures += 1
-                        if self.active_procedure.step_failures >= 3:
-                            # Procedure exhausted — record failed episode before rollback
-                            await self._record_and_reflect(resolved=False)
-                            logger.warning(f"[ORCHESTRATOR] Procedure step failed 3 times. Rolling back procedure.")
-                            await self._rollback_procedure()
+                        # We only evaluate health checks inside _advance_procedure
+                        # So just tell it to advance.
+                        advanced = await self._advance_procedure()
+                        if advanced:
+                            # Step advanced, go back to ASSURANCE window
                             continue
+                        else:
+                            # Procedure is completely out of steps and anomaly still isn't resolved
+                            #
+                            # We use the Reflexion logic, and rollback the procedural changes 
+                            # to give the LLM a chance to correct its mistake and try a different approach
+                            self.active_procedure.step_failures += 1
+                            if self.active_procedure.step_failures >= 3:
+                                await self._record_and_reflect(resolved=False)
+                                await self._rollback_procedure()
+                                continue
 
-                    # Adaptation loop — don't record episode yet, wait for eventual resolution
+                    # Normal LLM Adaptation loop
                     self.adaptation_cycle_count += 1
 
                     if self.adaptation_cycle_count >= self.MAX_ADAPTATION_CYCLES:
-                        # Adaptation exhausted — record failed episode, return to MONITORING
-                        logger.warning(f"[ORCHESTRATOR] Adaptation limit reached ({self.MAX_ADAPTATION_CYCLES} cycles). "
-                                       "Recording failure and returning to MONITORING.")
-                        self._log_event("adaptation_exhausted",
-                                        metric=self.active_anomaly_metric,
-                                        cycles=self.adaptation_cycle_count)
+                        logger.warning(f"[ORCHESTRATOR] Adaptation limit reached...")
                         await self._record_and_reflect(resolved=False)
                         self.adaptation_cycle_count = 0
                         self._clear_anomaly_state()
                         self.state = IntentState.MONITORING
                     else:
-                        logger.warning(f"[ORCHESTRATOR] WITHDRAWAL: Deviation persists (cycle {self.adaptation_cycle_count}/{self.MAX_ADAPTATION_CYCLES}). "
-                                       "Re-engaging Cognitive Core for adaptation.")
+                        logger.warning(f"[ORCHESTRATOR] WITHDRAWAL: Deviation persists... Re-engaging Cognitive Core.")
                         self.state = IntentState.THINKING
                         self.thinking_start_time = current_time
                         self.e2_acks_received = 0
-                        metric = self.active_anomaly_metric
                         await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
-                            "type": "adapt_otm", "metric": metric,
+                            "type": "adapt_otm", "metric": self.active_anomaly_metric,
                             "value": self.last_metric_value,
                             "previous_otm": self.active_otm,
                             "scope": (self.triggering_anomaly or {}).get("scope") or {},
@@ -264,6 +302,11 @@ class OrchestratorAgent:
             while not q_dev.empty():
                 msg = q_dev.get_nowait()
                 dev = msg.payload
+
+                # Ignore cleared messages, we only care about actual anomalies TODO: make it more pretty but this is fine for this...
+                if dev.get("status") == "cleared":
+                    continue
+
                 metric = dev['metric']
 
                 # Suppress anomaly interrupts while a procedure is actively executing —
@@ -515,8 +558,15 @@ class OrchestratorAgent:
         asyncio.create_task(self.bus.pub("intent.execute", make_msg("orch", "NEW_TARGET", "v1", self.active_otm)))
 
     async def _release_anomaly_otm_if_needed(self):
-        """Drop an anomaly-driven active_otm after resolution and push a
-        baseline-revert OTM so ns-3 actuators return to default parameters.
+        """Drop an anomaly-driven active_otm after resolution.
+
+        We deliberately do NOT push a baseline-revert OTM: sending MCS/TX
+        actuator changes right after the procedure resolved tends to create
+        a state shock that MiniRocket edge-triggers on, producing a
+        self-inflicted anomaly ~5s later. Keep the actuator values that
+        stabilised the network; only clear the active OTM so the next
+        anomaly gets a fresh generate-OTM path.
+
         Manual/scheduled/escalated OTMs are preserved.
         """
         otm = self.active_otm
@@ -526,71 +576,87 @@ class OrchestratorAgent:
         if source != "anomaly":
             return
 
-        now_str = datetime.now(timezone.utc).isoformat()
-        logger.info("[ORCHESTRATOR] Anomaly resolved — releasing active_otm and reverting actuators to baseline.")
-
-        baseline_otm = {
-            "version": "1.0",
-            "objective": {"service": "mbb", "kpi": "baseline", "aggregation": "mean", "unit": "", "maximize": False},
-            "constraints": [
-                {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le", "threshold": 28, "unit": "", "id": "BASELINE_MCS", "origin": "baseline_revert"},
-                {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge", "threshold": 46.0, "unit": "dBm", "id": "BASELINE_PWR", "origin": "baseline_revert"},
-            ],
-            "metadata": {
-                "timescale": "10s_window",
-                "source": "baseline_revert",
-                "procedure_id": None,
-                "cell_id": self.active_cell_id,
-                "ue_id": self.active_ue_id,
-                "adaptation_log": [f"[{now_str}] Anomaly resolved — reverting to baseline actuators."],
-            },
-        }
-
+        logger.info("[ORCHESTRATOR] Anomaly resolved — releasing active_otm "
+                    "(keeping actuator state that stabilised the network).")
         self.active_otm = None
-        await self.bus.pub("intent.execute", make_msg("orch", "BASELINE_REVERT", "v1", baseline_otm))
+
+    def _window_median(self, metric: str) -> Optional[float]:
+        """Median of the anomaly metric over the withdrawal window.
+
+        Mirrors the data-collection pattern of _evaluate_health_check: for each
+        raw KPM sample within WITHDRAWAL_WINDOW seconds, try the cell metric
+        first, otherwise average across UEs for that timestamp. Median (not
+        mean) is used because mmWave KPIs are heavy-tailed and the single
+        instantaneous sample previously consulted here could flip the verdict
+        on a transient spike.
+        """
+        now = time.time()
+        vals: List[float] = []
+        for t, raw in self.kpi_history:
+            if now - t > self.WITHDRAWAL_WINDOW:
+                continue
+            cell = raw.get("CellMetrics", {}) or {}
+            ues = raw.get("UEMetrics", []) or []
+            val = cell.get(metric)
+            if val is None and ues:
+                ue_vals = []
+                for ue in ues:
+                    if metric in ue and ue[metric] is not None:
+                        try:
+                            ue_vals.append(float(ue[metric]))
+                        except (ValueError, TypeError):
+                            pass
+                if ue_vals:
+                    val = sum(ue_vals) / len(ue_vals)
+            if val is not None:
+                try:
+                    vals.append(float(val))
+                except (ValueError, TypeError):
+                    pass
+        return statistics.median(vals) if vals else None
 
     async def _evaluate_withdrawal(self) -> bool:
         """Check whether the anomaly metric has recovered.
 
-        Uses the KnowledgeBase health thresholds as the success criteria.
-        Returns True if the deviation is resolved, False if it persists.
+        Uses the KnowledgeBase health thresholds as the success criteria,
+        evaluated against the median of the anomaly metric over the withdrawal
+        window (WITHDRAWAL_WINDOW seconds). Returns True if resolved.
 
         Episode recording is handled separately by _record_and_reflect() at
         cycle boundaries (not every intermediate procedure step).
         """
+        window_val: Optional[float] = None
         if self.active_anomaly_metric is None:
             # Nothing to evaluate (state-machine reached withdrawal without an
             # active anomaly — e.g. a scheduled-intent activation path).
             resolved = True
-        elif self.last_metric_value is None:
-            # Active anomaly but no telemetry in the withdrawal window — treat
-            # as unresolved rather than silently concluding success.
-            resolved = False
         else:
-            thresholds = self.kb.get_health_thresholds(self.active_cell_id or "default")
-            metric = self.active_anomaly_metric
-
-            m = metric.lower()
-            if "delay" in m or "latency" in m:
-                limit = thresholds.get("latency_max_ms", 50.0)
-                resolved = self.last_metric_value <= limit
-            elif "thp" in m or "throughput" in m:
-                # UEMetrics reports throughput in kbps (xApp emits raw ns-3
-                # kbps; the adapter's *1e6 branch is not taken for most
-                # telemetry paths — see kpms.csv: UE values are ~10k-20k,
-                # inconsistent with bps).  Align the threshold to kbps here.
-                limit = thresholds.get("throughput_min_mbps", 5.0) * 1000.0
-                resolved = self.last_metric_value >= limit
-            elif "bler" in m:
-                limit = thresholds.get("bler_max", 0.1)
-                resolved = self.last_metric_value <= limit
-            else:
+            window_val = self._window_median(self.active_anomaly_metric)
+            if window_val is None:
+                # Active anomaly but no telemetry in the withdrawal window —
+                # treat as unresolved rather than silently concluding success.
                 resolved = False
+            else:
+                thresholds = self.kb.get_health_thresholds(self.active_cell_id or "default")
+                m = self.active_anomaly_metric.lower()
+                if "delay" in m or "latency" in m:
+                    limit = thresholds.get("latency_max_ms", 50.0)
+                    resolved = window_val <= limit
+                elif "thp" in m or "throughput" in m:
+                    # Bus throughput values are in kbps (canonical unit, matches
+                    # kpms.csv). Convert the Mbps-denominated health threshold.
+                    limit = thresholds.get("throughput_min_mbps", 5.0) * 1000.0
+                    resolved = window_val >= limit
+                elif "bler" in m:
+                    limit = thresholds.get("bler_max", 0.1)
+                    resolved = window_val <= limit
+                else:
+                    resolved = False
 
         self._log_event("withdrawal_eval",
                         resolved=resolved,
                         metric=self.active_anomaly_metric,
-                        value=self.last_metric_value,
+                        value=window_val,
                         e2_acks=self.e2_acks_received)
 
         return resolved
@@ -733,11 +799,15 @@ class OrchestratorAgent:
                         
                         failed_metric = step.health_check["checks"][0]["metric"]
                         val = self.last_kpi_snapshot.get("CellMetrics", {}).get(failed_metric, 0.0)
+
+
                         
                         # fallback and human escalation... i dont know if this is needed
                         if self.scenario_failure_count >= 2:
                             logger.critical(f"[ESCALATION] Multiple scenarios failed to resolve anomaly on '{failed_metric}'. Applying Safe Baseline and FREEZING.")
                             await self._publish_procedure_update("procedure_failed", step)
+
+                            await self._record_and_reflect(resolved=False)
                             
                             # Wipe the broken procedure
                             self.active_procedure = None
@@ -782,6 +852,7 @@ class OrchestratorAgent:
                         # SCENARIO SWITCH
                         logger.warning(f"[ORCHESTRATOR] Health check failed 3 times. Escalating '{failed_metric}' issue to Cognitive Core for Scenario Switch.")
                         await self._publish_procedure_update("procedure_failed", step)
+                        await self._record_and_reflect(resolved=False)
                         await self._rollback_procedure()
                         
                         self.state = IntentState.THINKING
@@ -796,9 +867,6 @@ class OrchestratorAgent:
                         return True
                         
                     logger.warning(f"[ORCHESTRATOR] Routing health check failure to AI Adaptation (attempt {proc.step_failures}/3).")
-                    self.state = IntentState.THINKING
-                    self.thinking_start_time = time.time()
-                    self.e2_acks_received = 0
                     
                     # Step back so we re-evaluate this exact health check next loop
                     proc.current_step_idx -= 1
@@ -807,14 +875,41 @@ class OrchestratorAgent:
                     failed_metric = step.health_check["checks"][0]["metric"]
                     val = self.last_kpi_snapshot.get("CellMetrics", {}).get(failed_metric, 0.0)
                     
-                    # Let LLM adapt the OTM if the health check failed.
-                    asyncio.create_task(self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
-                        "type": "adapt_otm", 
-                        "metric": failed_metric,
-                        "value": val,
-                        "previous_otm": self.active_otm
-                    })))
-                    return True  # Keep procedure active, wait for AI to generate new OTM
+                    # Check if we need to reflect before adapting
+                    if proc.step_failures > 1:
+                        logger.info("[ORCHESTRATOR] LLM adaptation failed. Triggering Reflexion before re-adapting.")
+                        
+                        # 1. Trigger the reflection to save the failure into the episode store
+                        await self._record_and_reflect(resolved=False)
+                        
+                        # 2. Enter the new REFLECTING state so the main loop waits
+                        self.state = IntentState.REFLECTING
+                        self.reflecting_start_time = time.time()
+                        self.e2_acks_received = 0
+                        
+                        # 3. Store the context so the main loop can send the adapt_otm request AFTER reflection finishes
+                        self.pending_adapt_context = {
+                            "metric": failed_metric,
+                            "value": val,
+                            "previous_otm": self.active_otm,
+                            "scope": (self.triggering_anomaly or {}).get("scope") or {}
+                        }
+                    else:
+                        # First failure means the static Knowledge Base defaults failed. No need to reflect, just adapt.
+                        self.state = IntentState.THINKING
+                        self.thinking_start_time = time.time()
+                        self.e2_acks_received = 0
+                        
+                        # Let LLM adapt the OTM immediately
+                        asyncio.create_task(self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
+                            "type": "adapt_otm", 
+                            "metric": failed_metric,
+                            "value": val,
+                            "previous_otm": self.active_otm,
+                            "scope": (self.triggering_anomaly or {}).get("scope") or {}
+                        })))
+                        
+                    return True  # Keep procedure active, wait for AI to finish reflecting/thinking
 
             # Skip non-capable steps without health checks
             if not step.ns3_capable or step.otm_fragment is None:
@@ -846,7 +941,6 @@ class OrchestratorAgent:
         return False  # No more steps
 
     def _merge_step_into_otm(self, step):
-        """Merge a procedure step's OTM fragment constraints into the active OTM."""
         if not self.active_otm or not step.otm_fragment:
             return
 
@@ -856,24 +950,51 @@ class OrchestratorAgent:
         for new_c in step.otm_fragment.get("constraints", []):
             cid = new_c.get("id")
             if cid in existing_ids:
-                # Update existing constraint (same PROC_* id from a previous step)
-                for ec in existing:
-                    if ec.get("id") == cid:
-                        ec["operator"] = new_c["operator"]
-                        ec["threshold"] = new_c["threshold"]
-                        ec["origin"] = "procedure_step"  # Tag for constraint executor
-                        break
+                # FIX: If the constraint already exists in the active_otm (meaning the LLM 
+                # put it there during adaptation), DO NOT overwrite it with the catalog defaults.
+                continue
             else:
                 tagged = dict(new_c)
-                tagged["origin"] = "procedure_step"  # Tag for constraint executor
+                tagged["origin"] = "procedure_step"
                 existing.append(tagged)
+
+    def _anomaly_metric_check(self) -> Optional[dict]:
+        """Build a health-check entry for the active anomaly metric.
+
+        The procedure's static health_check typically verifies proxy KPIs
+        (latency/BLER) that can pass while the actual triggering metric is
+        still out of spec. Injecting the anomaly metric itself guarantees
+        the procedure cannot claim resolution without confirming recovery
+        on the KPI that fired the anomaly.
+        """
+        metric = self.active_anomaly_metric
+        if not metric:
+            return None
+        thresholds = self.kb.get_health_thresholds(self.active_cell_id or "default")
+        m = metric.lower()
+        if "delay" in m or "latency" in m:
+            return {"metric": metric, "operator": "le",
+                    "threshold": float(thresholds.get("latency_max_ms", 50.0))}
+        if "thp" in m or "throughput" in m:
+            # throughput_min_mbps stored as Mbps; UE telemetry arrives in kbps
+            # (see _evaluate_withdrawal for the same conversion rationale).
+            return {"metric": metric, "operator": "ge",
+                    "threshold": float(thresholds.get("throughput_min_mbps", 5.0)) * 1000.0}
+        if "bler" in m:
+            return {"metric": metric, "operator": "le",
+                    "threshold": float(thresholds.get("bler_max", 0.1))}
+        return None
 
     def _evaluate_health_check(self, step: ProcedureStep) -> tuple:
         """Evaluate health check conditions against a 10-second rolling telemetry window.
 
         Returns (passed: bool, details: str).
         """
-        checks = step.health_check.get("checks", [])
+        checks = list(step.health_check.get("checks", []))
+        anomaly_check = self._anomaly_metric_check()
+        if anomaly_check is not None and not any(
+                c.get("metric") == anomaly_check["metric"] for c in checks):
+            checks.append(anomaly_check)
         now = time.time()
         
         # Ensure we are only looking at data from the last 10 seconds

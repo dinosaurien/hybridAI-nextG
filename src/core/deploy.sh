@@ -4,6 +4,7 @@
 set -e
 
 export PROJECT_ROOT="/home/exposed/Desktop/hybridAI-nextG"
+export LD_LIBRARY_PATH="/opt/rocm_sdk_612/lib:/opt/rocm_sdk_612/lib64:/opt/rocm_sdk_612/rocm_smi/lib:$LD_LIBRARY_PATH"
 export PYTHONPATH="$PROJECT_ROOT/src/demo:$PROJECT_ROOT/src:$PROJECT_ROOT:$PYTHONPATH"
 
 cd "$PROJECT_ROOT"
@@ -57,4 +58,4 @@ echo "=========================================="
 
 # RUN THE CORE SYSTEM USING POETRY
 # exec ensures the python process takes over the shell
-exec poetry run python src/core/main.py "${ARGS[@]}"
+exec poetry run python src/core/main.py "${ARGS[@]}" "$@"

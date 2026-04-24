@@ -38,6 +38,87 @@ def _manual_intent_in_vocabulary(text: str) -> bool:
     return any(kw in lowered for kw in MANUAL_INTENT_VOCAB)
 
 
+# Canonical constraint identities — the ONLY ids the LLM is allowed to
+# adapt. Constraint identities flow from KB procedure catalog → orchestrator.
+# The LLM's output is gated through _sanitize_llm_constraints: it may update
+# thresholds of existing canonical ids (or add missing ones during merge),
+# but any hallucinated id, old {parameter, value} shape, or non-actuatable
+# kpi is discarded at the boundary.
+CANONICAL_CONSTRAINT_IDS = {"PROC_MCS", "PROC_TXPOW"}
+_ID_TO_KPI = {"PROC_MCS": "dl_mcs_max", "PROC_TXPOW": "tx_power_dbm"}
+_ID_TO_OPERATOR = {"PROC_MCS": "le", "PROC_TXPOW": "ge"}
+_ID_TO_UNIT = {"PROC_MCS": "", "PROC_TXPOW": "dBm"}
+_KPI_TO_ID = {"dl_mcs_max": "PROC_MCS", "tx_power_dbm": "PROC_TXPOW"}
+
+
+def _sanitize_llm_constraints(base_constraints: list, llm_constraints: list) -> list:
+    """Rebuild the canonical constraint array from a trusted base, applying
+    LLM-emitted threshold deltas only for recognized canonical ids.
+
+    - Start from base_constraints (all canonical ids already in the active
+      or previous OTM). Preserves shape including non-threshold fields.
+    - For each LLM constraint: resolve id (from explicit 'id' or inferred
+      from 'kpi'/'parameter'); resolve threshold ('threshold' or legacy
+      'value'). Match by id → update threshold only. New canonical id →
+      synthesize full canonical entry. Anything else → discarded.
+    """
+    result: list = []
+    by_id: dict = {}
+    for c in base_constraints or []:
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("id")
+        if not cid or cid in by_id:
+            continue
+        entry = dict(c)
+        entry.pop("applied_value", None)  # recompute per dispatch
+        result.append(entry)
+        by_id[cid] = entry
+
+    for c in llm_constraints or []:
+        if not isinstance(c, dict):
+            continue
+        raw_threshold = c.get("threshold", c.get("value"))
+        if raw_threshold is None:
+            continue
+        try:
+            new_threshold = float(raw_threshold)
+        except (TypeError, ValueError):
+            continue
+
+        cid = c.get("id")
+        if not cid:
+            cid = _KPI_TO_ID.get(c.get("kpi") or c.get("parameter"))
+        if not cid:
+            continue
+
+        if cid in by_id:
+            by_id[cid]["threshold"] = new_threshold
+            by_id[cid]["adapted_by"] = "cognitive_llm"
+            
+            # The LLM must be able to change a floor to a ceiling
+            if "operator" in c:
+                by_id[cid]["operator"] = c["operator"]
+                
+        elif cid in CANONICAL_CONSTRAINT_IDS:
+            synthesized = {
+                "service": "mbb",
+                "kpi": _ID_TO_KPI[cid],
+                # Trust the LLM's operator, fallback to default only if missing
+                "operator": c.get("operator", _ID_TO_OPERATOR[cid]),
+                "threshold": new_threshold,
+                "unit": _ID_TO_UNIT[cid],
+                "id": cid,
+                "origin": "cognitive_llm",
+                "adapted_by": "cognitive_llm",
+            }
+            result.append(synthesized)
+            by_id[cid] = synthesized
+        # unknown id or non-actuatable kpi → discarded silently
+
+    return result
+
+
 OTM_SCHEMA_TEMPLATE = """
 {
   "version": "1.0",
@@ -48,7 +129,7 @@ OTM_SCHEMA_TEMPLATE = """
 """
 
 class CognitiveAgent:
-    MAX_NEW_TOKENS = 4096
+    MAX_NEW_TOKENS = 16384
 
     def __init__(self, bus, kb, episode_store=None):
         self.bus = bus
@@ -70,7 +151,7 @@ class CognitiveAgent:
             self.model = Llama(
                 model_path=model_path,
                 n_gpu_layers=-1, 
-                n_ctx=4096,      
+                n_ctx=16384,      
                 verbose=False    
             )
             
@@ -88,10 +169,16 @@ class CognitiveAgent:
     def _generate_locked(self, prompt: str) -> dict:
         system_prompt = (
             "You are a 5G Network AI. Output ONLY valid JSON. No markdown, no explanations.\n"
+            "ARCHITECTURAL ROLE:\n"
+            "You do not set exact hardware values. You define the \"Feasible Search Space\" for a downstream mathematical optimizer.\n"
+            "- To set a MAXIMUM limit (a ceiling), use the operator \"le\" (less than or equal to).\n"
+            "- To set a MINIMUM limit (a floor), use the operator \"ge\" (greater than or equal to).\n"
+            "The downstream optimizer will read your objective and pick a specific numerical value within the boundaries you set.\n"
+            "If the optimizer picks a value that causes network failure, you must restrict its search space by lowering the ceiling (\"le\") or raising the floor (\"ge\").\n"
             "UNIT RULES (NEVER violate these):\n"
             "OBSERVABLE METRICS (use in objective or constraints):\n"
             "- Latency/Delay (DRB_PdcpSduDelayDl, UE_DRB_PdcpSduDelayDl_UEID): unit is ms, typical range 5-200. Example threshold: 50.0\n"
-            "- Throughput (UE_DRB_UEThpDl_UEID): unit is bps, typical range 1000000-500000000. Example threshold: 50000000.0\n"
+            "- Throughput (UE_DRB_UEThpDl_UEID): unit is kbps, typical range 1000-500000. Example threshold: 50000.0\n"
             "- BLER (UE_DRB_BlerDl_UEID): unitless ratio, range 0.0-1.0. Example threshold: 0.01\n"
             "- PRB utilization (RRU_PrbUsedDl): percentage, range 0-100. Example threshold: 80.0\n"
             "ACTUATABLE PARAMETERS (include these in constraints — they are applied directly to the network):\n"
@@ -327,11 +414,11 @@ class CognitiveAgent:
             otm = episode.get("otm_prescribed", {})
 
             # Canonical Reflexion: Msr is invoked when Me reports failure.
-            # The orchestrator already guards the publish on `resolved=False`,
-            # but we defend here too so a misrouted event does not waste tokens.
             if outcome.get("resolved"):
-                logger.debug(f"[COGNITIVE] Skipping reflection for resolved episode "
-                             f"{(episode_id or '')[:8]}.")
+                logger.debug(f"[COGNITIVE] Skipping reflection for resolved episode {(episode_id or '')[:8]}.")
+                
+                # DEFENSIVE GUARD: Ensure we still unpause the Orchestrator even if we skip
+                await self.bus.pub("ai.reflection_done", make_msg("cognitive", "DONE", "v1", {"episode_id": episode_id}))
                 continue
 
             metric = anomaly.get("metric", "unknown")
@@ -339,13 +426,11 @@ class CognitiveAgent:
             val_before = anomaly.get("value", "?")
             val_after = outcome.get("metric_after", "?")
 
-            constraints_str = (json.dumps(otm.get("constraints", []), indent=2)
+            constraints_str = (json.dumps(otm.get("constraints",[]), indent=2)
                                if otm.get("constraints") else "none")
             proc_id = otm.get("procedure_id", "none")
 
-            # Pull prior reflections for the same task so the new reflection
-            # builds on earlier analysis rather than repeating it
-            # (Shinn et al. §3: mem is fed into Msr as additional context).
+            # Pull prior reflections for the same task
             prior_reflections_block = ""
             if self.episode_store:
                 priors = self.episode_store.get_recent_reflections(anomaly)
@@ -356,10 +441,6 @@ class CognitiveAgent:
                         + "\n"
                     )
 
-            # Canonical Reflexion prompt, adapted from the authors' reference
-            # implementation (hotpotqa_runs/prompts.py "reflect_prompt"),
-            # grounded in this project's two-actuator control space so the
-            # LLM cannot hallucinate out-of-scope recommendations.
             reflect_prompt = (
                 f"You are a 5G network-management AI that improves itself by "
                 f"self-reflecting on failed trials.\n\n"
@@ -391,7 +472,11 @@ class CognitiveAgent:
                 logger.info(f"[COGNITIVE] Reflexion stored for episode {episode_id[:8]}")
             elif not reflection_text:
                 logger.warning(f"[COGNITIVE] Empty reflection for episode {episode_id[:8] if episode_id else '?'}")
+            
+            # Notify Orchestrator that the reflection is complete so it can un-pause and adapt
+            await self.bus.pub("ai.reflection_done", make_msg("cognitive", "DONE", "v1", {"episode_id": episode_id}))
 
+    
     async def run(self):
         q = await self.bus.sub("ai.request")
 
@@ -438,7 +523,7 @@ class CognitiveAgent:
                     f"{experience_block}"
                     f"TASK:\n"
                     f"1. Generate a strict OTM JSON to fix this issue using the procedures.\n"
-                    f"2. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in bps (e.g., 50000000.0). DO NOT mix up these numbers!\n"
+                    f"2. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in kbps (e.g., 50000.0). DO NOT mix up these numbers!\n"
                     f"3. Keep the 'adaptation_log' extremely brief (max 1 sentence).\n\n"
                     f"STRICT SCHEMA TO FOLLOW:\n{OTM_SCHEMA_TEMPLATE}"
                 )
@@ -556,18 +641,25 @@ class CognitiveAgent:
                     constraints_for_llm.append(entry)
                 constraints_str = "\n".join(f"  - {e}" for e in constraints_for_llm) if constraints_for_llm else "none"
 
+                prev_log_entries = prev_otm.get("metadata", {}).get("adaptation_log", [])
+                log_context = "\n".join([f" - {entry}" for entry in prev_log_entries])
+                if not log_context:
+                    log_context = " - No previous adaptations."
+
                 prompt = (
                     f"ADAPTATION REQUIRED: The network procedure paused because metric '{metric}' failed a health check or is still deviating (current value: {val}).\n"
                     f"Active OTM Constraints that failed to fix this:\n{constraints_str}\n\n"
+                    # ---> INJECT THE HISTORY INTO THE PROMPT <---
+                    f"PREVIOUS ADAPTATION HISTORY:\n{log_context}\n\n"
                     f"NOTE: 'actual applied' shows the real parameter value sent to the network after objective-aware biasing. "
                     f"Your new threshold will also be biased — set it HIGHER than your target if the bias lowers it, or LOWER if the bias raises it.\n\n"
                     f"{experience_block}"
                     f"TASK:\n"
                     f"1. Make MARGINAL, incremental adjustments to the constraint thresholds.\n"
                     f"2. Generate an updated OTM JSON with adjusted constraints.\n"
-                    f"3. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in bps (e.g., 50000000.0). DO NOT mix up these numbers!\n"
+                    f"3. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in kbps (e.g., 50000.0). DO NOT mix up these numbers!\n"
                     f"4. CRITICAL: Use the STABLE procedure id in each constraint's 'id' field so the orchestrator updates the existing procedure constraint in place instead of duplicating it. Use id='PROC_MCS' for dl_mcs_max constraints and id='PROC_TXPOW' for tx_power_dbm constraints. Example: {{\"service\":\"mbb\",\"kpi\":\"dl_mcs_max\",\"operator\":\"le\",\"threshold\":16,\"unit\":\"\",\"id\":\"PROC_MCS\"}}.\n"
-                    f"5. Keep the 'adaptation_log' EXTREMELY BRIEF (MAXIMUM 1 short sentence summarizing the change). Do NOT write an essay.\n\n"
+                    f"5. Keep the 'adaptation_log' brief (MAXIMUM 2 short sentences summarizing the change).\n\n"
                     f"STRICT SCHEMA TO FOLLOW:\n{OTM_SCHEMA_TEMPLATE}"
                 )
             
@@ -637,6 +729,11 @@ class CognitiveAgent:
             if not prompt:
                 continue
 
+            logger.debug("\n" + "="*50)
+            logger.debug(f"[LLM PROMPT - {payload.get('type')}]")
+            logger.debug(prompt)
+            logger.debug("="*50 + "\n")
+
             logger.info(f"[COGNITIVE] Prompting LLM.")
             loop = asyncio.get_running_loop()
             otm_json = await loop.run_in_executor(self.executor, self._generate, prompt)
@@ -650,32 +747,27 @@ class CognitiveAgent:
                 req_type = payload.get("type")
                 source_tag = "cognitive_llm"
 
-                # Symbolic procedure_id resolution, KB decides actions, not the LLM
-                if req_type == "generate_otm":
-                    # Deterministic: SPARQL resolves metric → procedure_id
-                    metric = payload.get("metric")
-                    proc_id = self.kb.resolve_procedure_id(metric) if metric else None
-                    if proc_id:
-                        otm_json.setdefault("metadata", {})["procedure_id"] = proc_id
-                elif req_type == "adapt_otm":
-                    # Preserve procedure_id from previous OTM
-                    prev_proc_id = payload.get("previous_otm", {}).get("metadata", {}).get("procedure_id")
-                    if prev_proc_id:
-                        otm_json.setdefault("metadata", {})["procedure_id"] = prev_proc_id
+                # Constraint gateway: the LLM does NOT own constraint identity.
+                # The procedure catalog (applied by orchestrator._merge_step_into_otm)
+                # is the sole authority on canonical constraint shape and ids.
+                # Here we only allow threshold deltas on recognized canonical ids
+                # to pass through; hallucinated shapes/ids/kpis are discarded.
+                if req_type in ("adapt_otm", "merge_otm", "merge_manual"):
+                    base_src = payload.get("previous_otm") or payload.get("active_otm") or {}
+                    base_constraints = base_src.get("constraints", []) if isinstance(base_src, dict) else []
+                    llm_constraints = otm_json.get("constraints", [])
+                    if not isinstance(llm_constraints, list):
+                        llm_constraints = []
+                    otm_json["constraints"] = _sanitize_llm_constraints(base_constraints, llm_constraints)
+                elif req_type in ("generate_otm", "manual", "scenario_failed"):
+                    # Orchestrator fills these from the procedure catalog via
+                    # _merge_step_into_otm when activating the procedure.
+                    otm_json["constraints"] = []
 
-                # Stamp 'origin' on each constraint (only if not already set)
+                # Backfill origin tag where not already set (preserved from base)
                 for c in otm_json.get("constraints", []):
                     if not c.get("origin"):
                         c["origin"] = source_tag
-
-                # Stamp 'adapted_by' for adaptation/merge scenarios
-                if req_type in ("adapt_otm", "merge_otm", "merge_manual"):
-                    for c in otm_json.get("constraints", []):
-                        existing = c.get("adapted_by")
-                        if existing and source_tag not in existing:
-                            c["adapted_by"] = f"{existing} -> {source_tag}"
-                        elif not existing:
-                            c["adapted_by"] = source_tag
 
                 # Carry forward previous adaptation_log and append system entry
                 prev_log = []
@@ -690,12 +782,21 @@ class CognitiveAgent:
                     current_log = [current_log]
                 elif not isinstance(current_log, list):
                     current_log = []
-                
+
+                # same sanitization for prev_log — if LLM upstream emitted a bare string,
+                # list(prev_log) would iterate chars into entries
+                if isinstance(prev_log, str):
+                    prev_log = [prev_log]
+                elif not isinstance(prev_log, list):
+                    prev_log = []
+
                 # Write the sanitized list back to the JSON just to be extra safe
                 otm_json["metadata"]["adaptation_log"] = current_log
 
-                merged_log = list(prev_log)
-                for entry in current_log:
+                merged_log = []
+                for entry in list(prev_log) + list(current_log):
+                    if not isinstance(entry, str) or len(entry) < 3:
+                        continue
                     if entry not in merged_log:
                         merged_log.append(entry)
 
@@ -720,15 +821,40 @@ class CognitiveAgent:
 
                 otm_json["metadata"]["adaptation_log"] = merged_log
 
+                # procedure_id is a control-plane identifier — the LLM must not own it.
+                # Overwrite whatever the LLM emitted with the authoritative value for every req_type.
                 if req_type == "generate_otm":
+                    # SPARQL on the RDF graph is the single source of truth for
+                    # metric → procedure_id. The catalog dict's trigger_metrics
+                    # field is incomplete for some metrics (e.g. throughput KPIs),
+                    # so match_scenario_by_metric would wrongly return None here.
                     metric = payload.get("metric", "")
-                    matched = self.kb.match_scenario_by_metric(metric)
+                    matched = self.kb.resolve_procedure_id(metric) if metric else None
+                    otm_json["metadata"]["procedure_id"] = matched  # may be None if no match
                     if matched:
-                        otm_json["metadata"]["procedure_id"] = matched
                         merged_log.append(
                             f"[{now_str}] Anomaly on {metric} matched to procedure: "
                             f"{self.kb.get_scenario_name(matched)} (id={matched})"
                         )
+                elif req_type in ("adapt_otm", "merge_otm"):
+                    src = payload.get("previous_otm") or payload.get("active_otm") or {}
+                    otm_json["metadata"]["procedure_id"] = (
+                        src.get("metadata", {}).get("procedure_id") if isinstance(src, dict) else None
+                    )
+                elif req_type in ("manual", "merge_manual"):
+                    # Manual intents may legitimately target a KB scenario.
+                    # Validation order: trust LLM's id if it resolves, else fall
+                    # back to deterministic keyword match on the user text
+                    # (symmetric to generate_otm's SPARQL fallback).
+                    llm_pid = otm_json.get("metadata", {}).get("procedure_id")
+                    resolved_pid = None
+                    if llm_pid and self.kb.get_procedure_steps(llm_pid):
+                        resolved_pid = llm_pid
+                    else:
+                        kw_match = self.kb.match_scenario_by_keywords(payload.get("text", ""))
+                        if kw_match and self.kb.get_procedure_steps(kw_match):
+                            resolved_pid = kw_match
+                    otm_json["metadata"]["procedure_id"] = resolved_pid
 
                 # Temporal scheduling (for manual user intents), only one scheduled event at a time right now to keep it simple. 
                 if payload.get("type") in ("manual", "merge_manual"):

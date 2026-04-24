@@ -24,9 +24,30 @@ logger = logging.getLogger(__name__)
 
 class XAppKPIAdapter:
     """Converts xApp KPI format to internal format expected by RLObserver."""
-    
-    @staticmethod
-    def convert_xapp_kpi_to_internal(xapp_kpi: Dict[str, Any], meid: str) -> Dict[str, Any]:
+
+    def __init__(self):
+        # Single-cell workaround: some xApp KPI fragments arrive with a
+        # populated cellObjectID (e.g. CELL_1111) while others do not.
+        # Latch the first real id we see and substitute it in for later
+        # "unknown" emissions so downstream components (deviation scope,
+        # OTM metadata, episode task tuples) get a stable cell_id.
+        # TODO: drop this latch if/when the xApp consistently populates
+        # cellObjectID on every KPI fragment, or when multi-cell is added.
+        self.latched_cell_id: Optional[str] = None
+
+    def _latch_or_substitute(self, cell_id: str) -> str:
+        """Latch the first real cell_id seen; substitute it for later unknowns."""
+        if cell_id and cell_id != "unknown":
+            if self.latched_cell_id is None:
+                self.latched_cell_id = cell_id
+                logger.info(f"[KPI] Latched cell_id={cell_id} for this session "
+                            f"(will substitute subsequent 'unknown' emissions).")
+            return cell_id
+        if self.latched_cell_id is not None:
+            return self.latched_cell_id
+        return "unknown"
+
+    def convert_xapp_kpi_to_internal(self, xapp_kpi: Dict[str, Any], meid: str) -> Dict[str, Any]:
         """Convert xApp KPI format to internal format."""
         kpi_data = xapp_kpi.get("kpi", {})
         
@@ -47,7 +68,9 @@ class XAppKPIAdapter:
                     continue
                 
                 ue_metric["ue_id"] = str(ue_id)
-                ue_metric["cell_id"] = ue.get("cell_id") or ue.get("cellId") or cell_metrics.get("cell_id", "unknown")
+                ue_metric["cell_id"] = self._latch_or_substitute(
+                    ue.get("cell_id") or ue.get("cellId") or cell_metrics.get("cell_id", "unknown")
+                )
                 
                 # Extract UE-specific metrics from raw fields if available (backward compatibility)
                 # But prefer measurements array which has the correct names
@@ -63,7 +86,7 @@ class XAppKPIAdapter:
                 if "UE_PRB_Used_DL" in ue:
                     ue_metric["UE_RRU_PrbUsedDl_UEID"] = float(ue["UE_PRB_Used_DL"])
                 if "UE_Throughput_DL_Mbps" in ue:
-                    ue_metric["UE_DRB_UEThpDl_UEID"] = float(ue["UE_Throughput_DL_Mbps"]) * 1e6  # Convert Mbps to bps
+                    ue_metric["UE_DRB_UEThpDl_UEID"] = float(ue["UE_Throughput_DL_Mbps"]) * 1000.0  # Mbps -> kbps (canonical bus unit)
                 
                 # Extract from nested measurements if available
                 # Map to actual CSV column names: UE_DRB_PdcpSduDelayDl_UEID, UE_DRB_UEThpDl_UEID, etc.
@@ -78,7 +101,10 @@ class XAppKPIAdapter:
                     if "drb_pdcpsdudelaydl_ueid" in name_normalized or ("delay" in name_normalized and "pdcp" in name_normalized and "ue" in name_normalized):
                         ue_metric["UE_DRB_PdcpSduDelayDl_UEID"] = float(value)
                     elif "drb_uethpdl_ueid" in name_normalized or ("throughput" in name_normalized and "ue" in name_normalized and "dl" in name_normalized):
-                        ue_metric["UE_DRB_UEThpDl_UEID"] = float(value) * 1e6  # Convert Mbps to bps if needed
+                        # ns-3 emits this metric already in kbps (see kpms.csv column header
+                        # comment in evaluate_baseline.py). Keep kbps as the canonical bus unit
+                        # so bus, CSV, and training data all share one scale.
+                        ue_metric["UE_DRB_UEThpDl_UEID"] = float(value)
                     elif "rru_prbuseddl_ueid" in name_normalized or ("prb" in name_normalized and "used" in name_normalized and "ue" in name_normalized):
                         ue_metric["UE_RRU_PrbUsedDl_UEID"] = float(value)
                     elif "drb_blerdl_ueid" in name_normalized or ("bler" in name_normalized and "dl" in name_normalized and "ue" in name_normalized):
@@ -180,6 +206,7 @@ class XAppKPIAdapter:
             cell_id = "unknown"
         else:
             cell_id = f"CELL_{cell_id_raw}"
+        cell_id = self._latch_or_substitute(cell_id)
         if "cell_id" not in cell_metrics:
             cell_metrics["cell_id"] = cell_id
         
@@ -479,34 +506,8 @@ class XAppTCPServer:
                                     logger.info(f"  First measurement: {kpi_data['measurements'][0]}")
                             self._kpi_debug_logged.add(client_id)
 
-                        # Warn if critical metrics are missing from E2 reports
-                        if not hasattr(self, '_missing_metric_warned'):
-                            self._missing_metric_warned = False
-                        if not self._missing_metric_warned:
-                            measurements = kpi_data.get("measurements", [])
-                            # Collect measurement names (not dict keys — the "name" field values)
-                            all_metric_names = set(kpi_data.keys())
-                            for m in measurements:
-                                if "name" in m:
-                                    all_metric_names.add(m["name"])
-                            for ue_data in kpi_data.get("ues", []):
-                                all_metric_names.update(ue_data.keys())
-                                for um in ue_data.get("measurements", []):
-                                    if "name" in um:
-                                        all_metric_names.add(um["name"])
-                            expected = ["UE_PDCP_Delay_DL_ms", "DRB_PdcpSduDelayDl", "DRB.PdcpSduDelayDl", "DRB.PdcpSduDelayDl.UEID"]
-                            has_latency = any(k in all_metric_names for k in expected)
-                            if not has_latency:
-                                logger.warning("=" * 60)
-                                logger.warning("[XAPP] CRITICAL: No latency metric found in E2 reports!")
-                                logger.warning("[XAPP] Missing: UE_PDCP_Delay_DL_ms / DRB_PdcpSduDelayDl")
-                                logger.warning("[XAPP] MiniRocket anomaly detection will NOT work.")
-                                logger.warning("[XAPP] Check: does the ns-3 scenario call mmw->EnableTraces()?")
-                                logger.warning("=" * 60)
-                                self._missing_metric_warned = True
-
                         cell_id_raw = kpi_data.get("cellObjectID") or kpi_data.get("cell_id") or "unknown"
-                        
+
                         # Normalize cell_id: convert numeric strings to CELL_XXX format
                         # e.g., "1111" -> "CELL_1111", "0000" -> "CELL_0000"
                         if cell_id_raw != "unknown" and cell_id_raw and str(cell_id_raw).isdigit():
@@ -517,6 +518,7 @@ class XAppTCPServer:
                             cell_id = f"CELL_{cell_id_raw}"  # Prefix if not already prefixed
                         else:
                             cell_id = "unknown"
+                        cell_id = self.kpi_adapter._latch_or_substitute(cell_id)
                         
                         # Extract node_id if available
                         node_id = kpi_data.get("node_id") or kpi_data.get("nodeId") or message.get("node_id")
@@ -650,7 +652,6 @@ class XAppTCPServer:
                                     "meid": meid
                                 }
                             ))
-                            logger.debug(f"Published KPI to membus: kpi.raw")
                     else:
                         logger.warning(f"Unknown message type: {msg_type}")
                         

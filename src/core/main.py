@@ -149,7 +149,11 @@ async def run_deploy(tcp_server, args):
     actuator = ActuatorAgent(bus, cell_to_node_map=tcp_server.cell_to_node_map)
 
     # Deterministic constraint executor: OTM constraints → E2 commands directly
-    constraint_executor = ConstraintExecutor(bus)
+    constraint_executor = ConstraintExecutor(
+        bus, allow_adaptive_mcs=not args.no_adaptive_mcs
+    )
+    if args.no_adaptive_mcs:
+        logger.info("[DEPLOY] Adaptive-MCS escape hatch DISABLED (evaluation mode).")
 
     telemetry_agents = []
     if args.minirocket_gnb_model:
@@ -204,6 +208,10 @@ async def main():
                         help="deploy: full LLM system | baseline: no actions | fixed-otm: static rules only")
     parser.add_argument("--no-episodes", action="store_true",
                         help="Disable episodic memory (Reflexion ablation). Only affects deploy mode.")
+    parser.add_argument("--no-adaptive-mcs", action="store_true",
+                        help="Evaluation mode: disable the dl_mcs_max 'ge' → mcs=-1 escape hatch "
+                             "so the LLM must pick a concrete MCS integer. Prevents ns-3's AMC "
+                             "from trivially solving every episode and starving Reflexion of failures.")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=6000)
     parser.add_argument("--web-port", type=int, default=8080)

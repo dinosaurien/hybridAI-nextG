@@ -270,20 +270,9 @@ class DashboardClient {
             const ueId = ue.ue_id || 'Unknown';
             const latency = ue.UE_DRB_PdcpSduDelayDl_UEID;
             
+            // Bus value is instantaneous throughput in kbps.
             const currentRawThp = ue.UE_DRB_UEThpDl_UEID || 0;
-            let trueThpMbps = 0;
-
-            if (this.ueStats[ueId] !== undefined) {
-                let delta = currentRawThp - this.ueStats[ueId];
-                if (delta < 0) delta = 0; 
-                trueThpMbps = delta / 1e6; 
-                
-                // DEBUG TRAP:
-                console.log(`UE: ${ueId} | Raw: ${currentRawThp} | Prev: ${this.ueStats[ueId]} | Delta: ${delta} | Mbps: ${trueThpMbps}`);
-            } else {
-                trueThpMbps = 0; 
-            }
-            this.ueStats[ueId] = currentRawThp;
+            const trueThpMbps = currentRawThp / 1000;
 
             return `
                 <div class="ue-card">

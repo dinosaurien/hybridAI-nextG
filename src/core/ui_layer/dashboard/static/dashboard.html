@@ -335,14 +335,8 @@
                     }
 
                     if (currentRawThp !== undefined) {
-                        if (this.ueStats[ueId] !== undefined) {
-                            let deltaBytes = currentRawThp - this.ueStats[ueId];
-                            if (deltaBytes > 0) {
-                                let trueThpMbps = (deltaBytes * 80) / 1e6;
-                                this.displayCache[ueId].throughput = trueThpMbps.toFixed(2);
-                            }
-                        }
-                        this.ueStats[ueId] = currentRawThp;
+                        // Bus value is instantaneous throughput in kbps. Show it as Mbps.
+                        this.displayCache[ueId].throughput = (currentRawThp / 1000).toFixed(2);
                     }
 
                     return `
