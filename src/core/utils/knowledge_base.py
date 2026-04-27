@@ -68,22 +68,26 @@ PROCEDURE_CATALOG: Dict[str, dict] = {
 
     "graceful_degradation": {
         "name": "Graceful Degradation Under Overload",
-        "description": "Handle sustained network congestion by lowering MCS and boosting TX power.",
-        "trigger_keywords": ["overload", "congestion", "saturated"],
-        "trigger_metrics": ["DRB_PdcpSduDelayDl"],
-        "steps": [
-            ProcedureStep(0, "conservative_mcs", "Reduce MCS to prevent retransmissions under load",
-                          {"constraints": [{"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
-                                            "threshold": 18.0, "unit": "", "id": "PROC_MCS"}]},
+        "description": "Handle sustained network congestion by MAXIMIZING capacity to drain the queues.",
+        "trigger_keywords":["overload", "congestion", "saturated"],
+        "trigger_metrics":["DRB_PdcpSduDelayDl"],
+        "steps":[
+            # WEAK DEFAULT: MCS 16 restricts bandwidth, intentionally starving the network
+            ProcedureStep(0, "maximize_mcs", "Raise MCS ceiling to allow faster queue draining",
+                          {"constraints":[{"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
+                                            "threshold": 16.0, "unit": "", "id": "PROC_MCS"}]},
                           ns3_capable=True),
-            ProcedureStep(1, "boost_tx_power", "Increase Tx power to improve signal quality",
-                          {"constraints": [{"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge",
-                                            "threshold": 48.0, "unit": "dBm", "id": "PROC_TXPOW"}]},
+            # WEAK DEFAULT: 40 dBm isn't quite enough power to support peak capacity
+            ProcedureStep(1, "boost_tx_power", "Increase Tx power to support the higher MCS",
+                          {"constraints":[{"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge",
+                                            "threshold": 40.0, "unit": "dBm", "id": "PROC_TXPOW"}]},
                           ns3_capable=True),
-            ProcedureStep(2, "verify_final_congestion", "Verify final latency",
+            # HEALTH CHECK: Requires Latency < 20ms AND Throughput > 15 Mbps (15000 kbps)
+            ProcedureStep(2, "verify_final_congestion", "Verify final latency and throughput",
                   None, ns3_capable=True,
-                  health_check={"checks": [
-                      {"metric": "DRB_PdcpSduDelayDl", "operator": "le", "threshold": 7.0},
+                  health_check={"checks":[
+                      {"metric": "DRB_PdcpSduDelayDl", "operator": "le", "threshold": 15.0},
+                      {"metric": "UE_DRB_UEThpDl_UEID", "operator": "ge", "threshold": 15000.0},
                   ]}),
         ],
     },
@@ -117,18 +121,26 @@ PROCEDURE_CATALOG: Dict[str, dict] = {
         "trigger_keywords": ["energy", "night", "power save", "eco"],
         "trigger_metrics": ["tx_power_dbm"],
         "steps": [
+            # Tx-power floor of the executor clamp is 30 dBm; setting "le 30"
+            # forces the executor to dispatch the minimum allowed transmit
+            # power for genuine energy savings rather than the previous 38 dBm
+            # (which was higher than the simulator default).
             ProcedureStep(0, "reduce_tx_power", "Step 1: Reduce Tx power",
                           {"constraints": [{"service": "mbb", "kpi": "tx_power_dbm", "operator": "le",
-                                            "threshold": 38.0, "unit": "dBm", "id": "PROC_TXPOW"}]},
+                                            "threshold": 30.0, "unit": "dBm", "id": "PROC_TXPOW"}]},
                           ns3_capable=True),
             ProcedureStep(1, "verify_after_power", "Verify QoS floors after Tx power reduction",
                           None, ns3_capable=True,
                           health_check={"checks": [
                               {"metric": "DRB_PdcpSduDelayDl", "operator": "le", "threshold": 80.0},
                           ]}),
+            # MCS cap tightened from 16 to 8 — with the latency-objective bias
+            # (direction=low, bias=0.3) the dispatched MCS becomes ~5, much
+            # lower than the previous 11 and consistent with the energy-saving
+            # intent of fewer bits-per-symbol and lower scheduler activity.
             ProcedureStep(2, "reduce_mcs", "Step 2: Reduce MCS to limit retransmission energy",
                           {"constraints": [{"service": "mbb", "kpi": "dl_mcs_max", "operator": "le",
-                                            "threshold": 16.0, "unit": "", "id": "PROC_MCS"}]},
+                                            "threshold": 8.0, "unit": "", "id": "PROC_MCS"}]},
                           ns3_capable=True),
             ProcedureStep(3, "verify_after_mcs", "Verify QoS floors after MCS reduction",
                           None, ns3_capable=True,

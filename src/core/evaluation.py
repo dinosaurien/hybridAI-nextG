@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Evaluation & Aggregation Plotter (Master's Thesis Edition)
-
 Reads KPI data from multiple kpms.csv runs (e.g., 5 baselines, 5 AI runs) and generates
 aggregated evaluation plots:
-  1. Ablation Bar Charts: Average Latency, Throughput, Recovery Time, Anomalies.
-  2. Pareto Trade-off Graph: 2D Scatter of Energy/MCS vs Latency.
+  Ablation Bar Charts: Average Latency, Throughput, Recovery Time, Anomalies.
+
+It also creates a summary table in LaTex format for easy inclusion in the thesis.
 
 Usage:
   python evaluate_baseline.py \
@@ -111,11 +110,11 @@ def compute_run_metrics(data: Dict) -> dict:
     """Compute scalar summary statistics for a single simulation run."""
     metrics = {}
     
-    # 1. Average Cell Latency
+    # Average Cell Latency
     lat_vals = [r["DRB_PdcpSduDelayDl"] for r in data["cell"] if "DRB_PdcpSduDelayDl" in r]
     metrics["latency_mean"] = np.mean(lat_vals) if lat_vals else np.nan
     
-    # 2. Average Aggregate Throughput
+    # Average Aggregate Throughput
     thp_by_ts = defaultdict(float)
     for uid, rows in data["ue"].items():
         for r in rows:
@@ -124,25 +123,25 @@ def compute_run_metrics(data: Dict) -> dict:
     thp_vals = list(thp_by_ts.values())
     metrics["throughput_mean"] = np.mean(thp_vals) if thp_vals else np.nan
     
-    # 3. Tx Power
+    # Tx Power
     tx_vals = [r["tx_power_dbm"] for r in data["cell"] if "tx_power_dbm" in r]
     metrics["tx_power_mean"] = np.mean(tx_vals) if tx_vals else np.nan
     
-    # 4. MCS Average
+    # MCS Average
     mcs_vals =[r["mcs_dl_avg"] for r in data["cell"] if "mcs_dl_avg" in r]
     metrics["mcs_mean"] = np.mean(mcs_vals) if mcs_vals else np.nan
     
-    # 5. PRB Usage
+    # PRB Usage
     prb_vals = [r["RRU_PrbUsedDl"] for r in data["cell"] if "RRU_PrbUsedDl" in r]
     metrics["prb_mean"] = np.mean(prb_vals) if prb_vals else np.nan
 
-    # 6. Recovery Time & Anomalies (Spikes over 40ms)
+    # Recovery Time & Anomalies (Spikes over 40ms)
     events, unrecovered = analyze_recovery_times(data, metric="DRB_PdcpSduDelayDl", threshold=40.0)
     metrics["anomaly_count"] = len(events) + unrecovered
     
     rec_times = [e["recovery_s"] for e in events]
     if metrics["anomaly_count"] == 0:
-        metrics["recovery_time_mean"] = 0.0
+        metrics["recovery_time_mean"] = np.nan # No anomalies
     elif len(events) > 0:
         metrics["recovery_time_mean"] = np.mean(rec_times)
     else:
@@ -151,35 +150,68 @@ def compute_run_metrics(data: Dict) -> dict:
     return metrics
 
 def print_summary_table(categories: Dict[str, List[dict]]):
-    """Print the aggregated data to console in a clean ASCII table."""
-    print("\n" + "=" * 95)
-    print(f"{'Metric':<30} | " + " | ".join([f"{lbl[:16]:>13}" for lbl in categories.keys()]))
-    print("-" * 95)
+    """Print the aggregated data to console in a clean ASCII table and output LaTeX code."""
     
     metrics =[
         ("latency_mean", "Avg Latency (ms)"),
         ("throughput_mean", "Avg Throughput (kbps)"),
-        ("tx_power_mean", "Avg Tx Power (dBm)"),
-        ("mcs_mean", "Avg MCS (Index)"),
+        ("prb_mean", "Avg PRB Usage (%)"),
         ("anomaly_count", "Total Anomalies"),
         ("recovery_time_mean", "Recovery Time (s)")
     ]
     
+    headers =["Metric"] + list(categories.keys())
+    
+    table_rows =[]
     for m_key, m_name in metrics:
-        row = f"{m_name:<30} | "
+        row = [m_name]
         for lbl, runs in categories.items():
             vals = [r[m_key] for r in runs if not np.isnan(r.get(m_key, np.nan))]
             if vals:
                 mean_val = np.mean(vals)
                 std_val = np.std(vals)
                 if std_val > 0.01:
-                    row += f"{mean_val:>6.1f}±{std_val:<6.1f} | "
+                    row.append(f"{mean_val:.1f} ± {std_val:.1f}")
                 else:
-                    row += f"{mean_val:>6.1f}       | "
+                    row.append(f"{mean_val:.1f}")
             else:
-                row += f"{'N/A':>13} | "
-        print(row)
-    print("=" * 95 + "\n")
+                row.append("N/A")
+        table_rows.append(row)
+        
+    # Console Print
+    print("\n" + "=" * 105)
+    print(f"{'AGGREGATED SYSTEM PERFORMANCE METRICS (5 RUNS PER PHASE)':^105}")
+    print("=" * 105)
+    
+    col_width = 18
+    header_format = f"{{:<24}} | " + " | ".join([f"{{:^{col_width}}}" for _ in categories.keys()])
+    row_format = f"{{:<24}} | " + " | ".join([f"{{:^{col_width}}}" for _ in categories.keys()])
+    
+    print(header_format.format(*headers))
+    print("-" * 105)
+    for row in table_rows:
+        print(row_format.format(*row))
+    print("=" * 105 + "\n")
+    
+    # LaTeX Generation
+    print("\\begin{table}[h!]")
+    print("\\centering")
+    print("\\caption{Aggregated Performance Metrics across 5 Simulation Runs per Phase}")
+    print("\\label{tab:performance_metrics}")
+    print("\\begin{tabular}{l" + "c" * len(categories) + "}")
+    print("\\toprule")
+    print("\\textbf{Metric} & " + " & ".join([f"\\textbf{{{c}}}" for c in categories.keys()]) + " \\\\")
+    print("\\midrule")
+    
+    for row in table_rows:
+        # Escape the % sign for LaTeX
+        safe_row = [str(item).replace("%", "\\%") for item in row]
+        print(" & ".join(safe_row) + " \\\\")
+        
+    print("\\bottomrule")
+    print("\\end{tabular}")
+    print("\\end{table}")
+    print("==================================================\n")
 
 def plot_aggregated_bars(categories: Dict[str, List[dict]], out_dir: str):
     """Plot bar charts with error bars for the ablation study."""
@@ -225,59 +257,6 @@ def plot_aggregated_bars(categories: Dict[str, List[dict]], out_dir: str):
     plt.close()
     print(f"Saved Ablation Bar Charts: {path}")
 
-def plot_tradeoff(categories: Dict[str, List[dict]], out_dir: str):
-    """Plot 2D Scatter for Intent-Steering Trade-off (Pareto Shift)."""
-    plt = _import_plt()
-    fig, ax = plt.subplots(figsize=(10, 7))
-    colors = {"Baseline": "tab:red", "AI (No Reflexion)": "tab:blue", "AI (Reflexion)": "tab:green", "Energy Intent": "tab:orange"}
-    
-    # Determine X-Axis dynamically based on what the simulator successfully logged
-    has_tx = any(not np.isnan(run.get("tx_power_mean", np.nan)) for runs in categories.values() for run in runs)
-    if has_tx:
-        x_key, x_label = "tx_power_mean", "Average Tx Power (dBm)"
-    else:
-        has_mcs = any(not np.isnan(run.get("mcs_mean", np.nan)) for runs in categories.values() for run in runs)
-        if has_mcs:
-            x_key, x_label = "mcs_mean", "Average MCS (Index)"
-        else:
-            x_key, x_label = "prb_mean", "Average PRB Usage (%)"
-            
-    y_key, y_label = "latency_mean", "Average Latency (ms)"
-    
-    for label, runs in categories.items():
-        color = colors.get(label, "tab:gray")
-        x_vals = [run[x_key] for run in runs if not np.isnan(run.get(x_key, np.nan))]
-        y_vals = [run[y_key] for run in runs if not np.isnan(run.get(y_key, np.nan))]
-        
-        if not x_vals or not y_vals:
-            continue
-            
-        # Plot individual runs
-        ax.scatter(x_vals, y_vals, label=f"{label} (Individual Runs)", color=color, alpha=0.5, s=80, edgecolors="white")
-        # Plot centroid
-        ax.scatter(np.mean(x_vals), np.mean(y_vals), color=color, marker="X", s=300, edgecolor="black", zorder=5, label=f"{label} (Centroid)")
-            
-    ax.set_xlabel(x_label, fontsize=12)
-    ax.set_ylabel(y_label, fontsize=12)
-    ax.set_title("Multi-Objective Trade-off (Pareto Shift)", fontsize=14, fontweight="bold")
-    
-    # Shrink current axis by 20% to fit legend outside
-    box = ax.get_position()
-    ax.set_position([box.x0, box.y0, box.width * 0.8, box.height])
-    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=10)
-    
-    ax.grid(True, linestyle="--", alpha=0.6)
-    
-    ax.annotate("Ideal Region\n(Low Latency, Low Energy)", 
-                xy=(0.02, 0.02), xycoords='axes fraction', 
-                bbox=dict(boxstyle="round,pad=0.3", fc="lightgreen", alpha=0.3),
-                fontsize=11)
-                
-    path = os.path.join(out_dir, "intent_tradeoff_pareto.png")
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Saved Pareto Trade-off Graph: {path}")
-
 def main():
     parser = argparse.ArgumentParser(description="Aggregated Thesis Evaluator for 5G AI Architecture")
     parser.add_argument("--baseline", nargs='+', help="List of baseline CSV files (e.g., baseline1.csv baseline2.csv)")
@@ -310,7 +289,6 @@ def main():
 
     # Generate Plots
     plot_aggregated_bars(categories, args.out_dir)
-    plot_tradeoff(categories, args.out_dir)
     
     print("\nEvaluation complete! Add these plots to your Results section.")
 

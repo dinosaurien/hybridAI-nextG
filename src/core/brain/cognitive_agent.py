@@ -124,7 +124,7 @@ OTM_SCHEMA_TEMPLATE = """
   "version": "1.0",
   "objective": { "service": "mbb", "kpi": "<MAIN_KPI>", "aggregation": "mean", "unit": "<UNIT>", "maximize": true_or_false },
   "constraints": [],
-  "metadata": { "timescale": "10s_window", "timestamp": "<TIME>", "episode": "<ID>", "procedure_id": "<SCENARIO_ID_OR_NULL>", "adaptation_log": [] }
+  "metadata": { "adaptation_log": [] }
 }
 """
 
@@ -185,7 +185,9 @@ class CognitiveAgent:
             "- MCS cap (dl_mcs_max): integer index, range 0-28. Example threshold: 20\n"
             "- TX power (tx_power_dbm): unit is dBm, range 30-60. Example threshold: 46.0\n"
             "You MUST include at least one actuatable parameter in your constraints, otherwise no action will be taken.\n"
-            "NEVER use throughput-scale numbers (millions) for latency thresholds or vice versa."
+            "NEVER use throughput-scale numbers (millions) for latency thresholds or vice versa.\n"
+            "CONSTRAINT IDENTIFIERS:\n"
+            "When constraints from a previous Intent Specification are shown to you in the prompt, copy their `id` field verbatim and adjust only the threshold value. Never invent new constraint identifiers — they will be discarded by the downstream sanitiser."
         )
         
         # llama.cpp has built-in chat templating
@@ -196,7 +198,7 @@ class CognitiveAgent:
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=self.MAX_NEW_TOKENS,
-                temperature=0.1, # Keep it strict for JSON schema adherence
+                temperature=0.0, # Greedy decoding for strict JSON schema adherence
             )
             
             resp_text = response["choices"][0]["message"]["content"]
@@ -500,8 +502,8 @@ class CognitiveAgent:
                 kb_recommendations = self.kb.query_scenario(metric)
                 rec_str = json.dumps(kb_recommendations) if kb_recommendations else "None."
 
-                # Reflexion tail-take: last Omega reflections for THIS task
-                # (metric, cell_id). No embedding similarity — see Shinn et
+                # Reflexion tail-take: reflections are for THIS task
+                # (metric, cell_id). No embedding similarity , see Shinn et
                 # al. 2023 Algorithm 1 and episode_store.ReflexionMemory.
                 experience_block = ""
                 if self.episode_store:
@@ -630,11 +632,14 @@ class CognitiveAgent:
 
                 # Show APPLIED values (what actually went to ns-3), not just thresholds.
                 # The constraint executor writes 'applied_value' into each constraint
-                # after objective-biased parameter selection.
+                # after objective-biased parameter selection. We also include the
+                # canonical id in the rendering so the LLM can copy it forward
+                # rather than inventing one.
                 prev_constraints = prev_otm.get("constraints", [])
                 constraints_for_llm = []
                 for c in prev_constraints:
-                    entry = f"{c.get('kpi')} {c.get('operator')} {c.get('threshold')}"
+                    cid = c.get("id", "UNKNOWN")
+                    entry = f"id={cid}: {c.get('kpi')} {c.get('operator')} {c.get('threshold')}"
                     applied = c.get("applied_value")
                     if applied is not None and applied != c.get("threshold"):
                         entry += f" (actual applied: {applied})"
@@ -649,17 +654,17 @@ class CognitiveAgent:
                 prompt = (
                     f"ADAPTATION REQUIRED: The network procedure paused because metric '{metric}' failed a health check or is still deviating (current value: {val}).\n"
                     f"Active OTM Constraints that failed to fix this:\n{constraints_str}\n\n"
-                    # ---> INJECT THE HISTORY INTO THE PROMPT <---
                     f"PREVIOUS ADAPTATION HISTORY:\n{log_context}\n\n"
                     f"NOTE: 'actual applied' shows the real parameter value sent to the network after objective-aware biasing. "
                     f"Your new threshold will also be biased — set it HIGHER than your target if the bias lowers it, or LOWER if the bias raises it.\n\n"
                     f"{experience_block}"
                     f"TASK:\n"
-                    f"1. Make MARGINAL, incremental adjustments to the constraint thresholds.\n"
-                    f"2. Generate an updated OTM JSON with adjusted constraints.\n"
-                    f"3. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in kbps (e.g., 50000.0). DO NOT mix up these numbers!\n"
-                    f"4. CRITICAL: Use the STABLE procedure id in each constraint's 'id' field so the orchestrator updates the existing procedure constraint in place instead of duplicating it. Use id='PROC_MCS' for dl_mcs_max constraints and id='PROC_TXPOW' for tx_power_dbm constraints. Example: {{\"service\":\"mbb\",\"kpi\":\"dl_mcs_max\",\"operator\":\"le\",\"threshold\":16,\"unit\":\"\",\"id\":\"PROC_MCS\"}}.\n"
-                    f"5. Keep the 'adaptation_log' brief (MAXIMUM 2 short sentences summarizing the change).\n\n"
+                    f"1. Make incremental adjustments to the constraint thresholds.\n"
+                    f"2. MANDATORY: At least one constraint's threshold value MUST differ from the value shown in the active OTM above. Returning the same thresholds unchanged is treated as a refusal to adapt and the system will escalate; even a small numeric shift (e.g. ±1 for MCS, ±2 dBm for TX power) is preferable to repeating the previous values.\n"
+                    f"3. Generate an updated OTM JSON with adjusted constraints.\n"
+                    f"4. WARNING: Latency/Delay is measured in ms (e.g., 40.0 to 80.0). Throughput is measured in kbps (e.g., 50000.0). DO NOT mix up these numbers!\n"
+                    f"5. CRITICAL: Preserve the `id` field of each existing constraint exactly as shown above. Do not invent new id values; the orchestrator updates constraints in place by matching on id, so any unrecognised id will be silently dropped by the sanitiser. Modify only the threshold value, not the id, kpi, operator, or unit fields.\n"
+                    f"6. Keep the 'adaptation_log' brief (MAXIMUM 2 short sentences summarizing the change).\n\n"
                     f"STRICT SCHEMA TO FOLLOW:\n{OTM_SCHEMA_TEMPLATE}"
                 )
             
@@ -693,9 +698,9 @@ class CognitiveAgent:
                 kb_recommendations = self.kb.query_scenario(anomaly_metric)
                 rec_str = json.dumps(kb_recommendations) if kb_recommendations else "None."
 
-                # Reflexion tail-take on the incoming anomaly's task — same
+                # Reflexion take on the incoming anomaly's task, same
                 # semantics as generate_otm/adapt_otm. Merging is still a
-                # reactive response to the anomaly; prior reflections on
+                # reactive response to the anomaly so prior reflections on
                 # this (metric, cell_id) are just as relevant.
                 experience_block = ""
                 if self.episode_store:
@@ -718,10 +723,10 @@ class CognitiveAgent:
                     f"KNOWLEDGE BASE PROCEDURES FOR NEW ANOMALY: {rec_str}\n\n"
                     f"{experience_block}"
                     f"TASK: Generate a MERGED OTM JSON that handles both the active OTM and the new anomaly.\n"
-                    f"1. PRESERVE the original objective and existing actuatable constraints from the active OTM if possible.\n"
-                    f"2. Add NEW actuatable constraints (dl_mcs_max, tx_power_dbm) to address the '{anomaly_metric}' anomaly, using the Knowledge Base procedures as a guide.\n"
-                    f"3. Do NOT add observational metrics (like Latency or Throughput) to the constraints array. Only add parameters the system can actuate.\n"
-                    f"4. If new constraints conflict with old ones (e.g., both set an MCS cap), prioritize the MORE CONSERVATIVE constraint (lower MCS, higher TX Power) to ensure stability.\n"
+                    f"1. PRESERVE the original objective and existing actuatable constraints from the active OTM if possible. When preserving a constraint, copy its `id` field verbatim from the active OTM shown above — do not rename it.\n"
+                    f"2. You may adjust the THRESHOLD VALUE of an existing constraint to address the '{anomaly_metric}' anomaly, using the Knowledge Base procedures as a guide. Keep the id, kpi, operator, and unit fields exactly as they appear in the active OTM.\n"
+                    f"3. Do NOT add observational metrics (like Latency or Throughput) to the constraints array. Only adjust parameters the system can actuate (dl_mcs_max, tx_power_dbm).\n"
+                    f"4. If a constraint adjustment conflicts with the original (e.g., both could be argued for a different MCS cap), prioritize the MORE CONSERVATIVE value (lower MCS ceiling, higher TX power floor) to ensure stability.\n"
                     f"5. Keep the 'adaptation_log' brief, motivate your reasoning. One or two sentences should suffice.\n"
                     f"STRICT SCHEMA TO FOLLOW:\n{OTM_SCHEMA_TEMPLATE}"
                 )

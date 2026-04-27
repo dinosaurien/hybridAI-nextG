@@ -26,8 +26,8 @@ class IntentState(Enum):
     ESCALATED = auto()  # System frozen after repeated failures — awaiting human intervention
 
 class OrchestratorAgent:
-    THINKING_TIMEOUT = 15.0   # seconds before assuming LLM failed to infer
-    REFLECTION_TIMEOUT = 10.0 # Seconds before assuming that the reflection process has failed to infer.
+    THINKING_TIMEOUT = 30.0   # seconds before assuming LLM failed to infer
+    REFLECTION_TIMEOUT = 20.0 # Seconds before assuming that the reflection process has failed to infer.
     WITHDRAWAL_WINDOW = 10.0  # seconds to evaluate post-assurance telemetry
     MAX_ADAPTATION_CYCLES = 5  # cap adaptation loops before declaring failure
     ESCALATED_TIMEOUT = 300.0  # seconds before auto-unlocking ESCALATED state
@@ -56,30 +56,13 @@ class OrchestratorAgent:
         self.schedule_queue: List[ScheduledIntent] = []
         self.active_procedure: Optional[ActiveProcedure] = None
         self.pending_cancel_revert = None  # OTM to revert to after graceful cancel completes
+        self.pre_merge_otm: Optional[dict] = None  # Snapshot of active OTM before an anomaly merged in, used to restore operator/scheduled intents after the merged anomaly resolves
         self.last_kpi_snapshot: dict = {}  # Full latest telemetry for health checks
         self.kpi_history = deque() # Stores timestamps and snapshots of recent KPIs for health check evaluation
         self.scenario_failure_count: int = 0  # Consecutive scenario failures (for escalation)
         self.adaptation_cycle_count: int = 0  # Consecutive adapt_otm cycles for current anomaly
         self.escalated_at: float = 0.0  # Timestamp when ESCALATED was entered
         self.escalated_anomaly_queue: list = []  # Anomalies received while ESCALATED
-
-        # Evaluation event log, append-only JSONL for later analysis of orchestration logic
-        self._event_log_path = Path("models/orchestrator_events.jsonl")
-        self._event_log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def _log_event(self, event_type: str, **data):
-        """Append a structured event to the orchestrator event log."""
-        entry = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "event": event_type,
-            "state": self.state.name,
-            **data,
-        }
-        try:
-            with open(self._event_log_path, "a") as f:
-                f.write(json.dumps(entry, default=str) + "\n")
-        except Exception:
-            pass  # Never crash for logging
 
     async def run(self):
         q_dev = await self.bus.sub("deviation.detected")
@@ -172,7 +155,6 @@ class OrchestratorAgent:
             if self.state == IntentState.ESCALATED and current_time >= self.escalated_at + self.ESCALATED_TIMEOUT:
                 logger.warning(f"[ORCHESTRATOR] ESCALATED timeout ({self.ESCALATED_TIMEOUT}s) reached. "
                                "Auto-unlocking to MONITORING. Safe-mode OTM remains active.")
-                self._log_event("escalated_timeout")
                 self.state = IntentState.MONITORING
 
             # ASSURANCE -> WITHDRAWAL transition
@@ -323,9 +305,6 @@ class OrchestratorAgent:
                     scope = dev.get("scope") or {}
                     self.active_cell_id = scope.get("cell_id")
                     self.active_ue_id = scope.get("ue_id")
-                    self._log_event("anomaly_detected",
-                                    metric=metric, value=dev.get('value'),
-                                    severity=dev.get('severity', 'unknown'))
                     self.state = IntentState.THINKING
                     self.thinking_start_time = current_time
                     self.e2_acks_received = 0
@@ -342,7 +321,21 @@ class OrchestratorAgent:
                             "scope": anomaly_scope,
                         }, corr_id=msg.corr_id))
                     elif self.active_otm:
-                        # Different metric or manual OTM active: merge anomaly into active OTM
+                        # Different metric or manual OTM active: merge anomaly into active OTM.
+                        # Snapshot the active OTM so we can restore it after the merged
+                        # anomaly resolves — preserves operator-driven intents (e.g. an
+                        # active "Energy Efficiency" intent) through the merge cycle.
+                        self.pre_merge_otm = copy.deepcopy(self.active_otm)
+                        # Stamp the anomaly's cell_id into the snapshot's metadata. The
+                        # merged OTM produced downstream will be stamped with the same
+                        # cell_id by _apply_otm, so the Constraint Executor's per-cell
+                        # idempotency cache will use the same key for both. Without this,
+                        # the snapshot retains the (possibly None / default) cell_id
+                        # from before the anomaly, the cache lookup falls on a stale
+                        # entry, and the restore-dispatch is silently skipped.
+                        if anomaly_scope.get("cell_id"):
+                            self.pre_merge_otm.setdefault("metadata", {})["cell_id"] = \
+                                anomaly_scope["cell_id"]
                         logger.info(f"[ORCHESTRATOR] Merging anomaly on {metric} into active OTM. (Trace: {msg.corr_id})")
                         await self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
                             "type": "merge_otm",
@@ -385,8 +378,6 @@ class OrchestratorAgent:
                 scope = latest.get("scope") or {}
                 self.active_cell_id = scope.get("cell_id")
                 self.active_ue_id = scope.get("ue_id")
-                self._log_event("anomaly_detected", metric=metric,
-                                value=latest.get('value'), severity=latest.get('severity', 'unknown'))
                 self.state = IntentState.THINKING
                 self.thinking_start_time = time.time()
                 self.e2_acks_received = 0
@@ -420,9 +411,6 @@ class OrchestratorAgent:
                 if msg.type == "LLM_FAILURE":
                     logger.warning(f"[ORCHESTRATOR] Cognitive Core failed to generate OTM "
                                    f"(type={msg.payload.get('request_type')}). Returning to MONITORING.")
-                    self._log_event("llm_generation_failed",
-                                    error=msg.payload.get("error"),
-                                    request_type=msg.payload.get("request_type"))
                     self._clear_anomaly_state()
                     self.state = IntentState.MONITORING
 
@@ -462,6 +450,11 @@ class OrchestratorAgent:
         self.triggering_anomaly = None
         self.last_metric_value = None
         self.adaptation_cycle_count = 0
+        # Pre-merge snapshot is consumed only by _release_anomaly_otm_if_needed on
+        # successful resolution. On any non-resolution path that funnels through
+        # _clear_anomaly_state (timeouts, LLM_FAILURE, adaptation-limit, scenario
+        # rollbacks), discard it so it cannot leak into a later anomaly cycle.
+        self.pre_merge_otm = None
 
     async def _route_manual_intent(self, text: str):
         """Route a manual intent — merge with active OTM if one exists, else fresh."""
@@ -549,26 +542,41 @@ class OrchestratorAgent:
                     logger.info(f"[ORCHESTRATOR] Procedure '{self.active_procedure.scenario_name}' activated. Entering ASSURANCE for step 0.")
 
         logger.info("[ORCHESTRATOR] OTM Received. Entering 30s ASSURANCE window.")
-        self._log_event("otm_applied",
-                        otm=otm,
-                        anomaly_metric=self.active_anomaly_metric,
-                        metric_value=self.last_metric_value,
-                        procedure_id=otm.get("metadata", {}).get("procedure_id"))
 
         asyncio.create_task(self.bus.pub("intent.execute", make_msg("orch", "NEW_TARGET", "v1", self.active_otm)))
 
     async def _release_anomaly_otm_if_needed(self):
-        """Drop an anomaly-driven active_otm after resolution.
+        """Restore the pre-merge OTM if one was snapshotted, otherwise drop
+        an anomaly-driven active_otm after resolution.
 
-        We deliberately do NOT push a baseline-revert OTM: sending MCS/TX
-        actuator changes right after the procedure resolved tends to create
-        a state shock that MiniRocket edge-triggers on, producing a
-        self-inflicted anomaly ~5s later. Keep the actuator values that
-        stabilised the network; only clear the active OTM so the next
-        anomaly gets a fresh generate-OTM path.
+        Two paths:
 
-        Manual/scheduled/escalated OTMs are preserved.
+        1. Pre-merge snapshot exists (an anomaly merged into an operator-
+           or scheduler-driven OTM): restore the snapshot as the active OTM
+           AND re-publish it so the constraint executor re-applies the
+           original constraints. This is what preserves a long-running
+           operator intent (e.g. "Energy Efficiency for 2 hours") through
+           an intervening anomaly cycle.
+
+        2. No pre-merge snapshot (a pure anomaly-driven cycle): drop the
+           OTM tracker but do NOT push a baseline-revert OTM. Sending MCS/TX
+           actuator changes right after the procedure resolved tends to
+           create a state shock that MiniRocket edge-triggers on, producing
+           a self-inflicted anomaly ~5s later. We keep the actuator values
+           that stabilised the network and let the next anomaly take a
+           fresh generate-OTM path.
         """
+        # Path 1: restore pre-merge OTM (preserves operator intent across merges)
+        if self.pre_merge_otm is not None:
+            restored = self.pre_merge_otm
+            self.pre_merge_otm = None
+            self.active_otm = restored
+            logger.info("[ORCHESTRATOR] Anomaly resolved — restoring active OTM to "
+                        "pre-merge state (operator intent preserved).")
+            await self.bus.pub("intent.execute", make_msg("orch", "ANOMALY_REVERT", "v1", restored))
+            return
+
+        # Path 2: drop the anomaly-driven OTM tracker
         otm = self.active_otm
         if not otm:
             return
@@ -652,12 +660,6 @@ class OrchestratorAgent:
                     resolved = window_val <= limit
                 else:
                     resolved = False
-
-        self._log_event("withdrawal_eval",
-                        resolved=resolved,
-                        metric=self.active_anomaly_metric,
-                        value=window_val,
-                        e2_acks=self.e2_acks_received)
 
         return resolved
 
@@ -791,73 +793,26 @@ class OrchestratorAgent:
                             proc.branched_to = True
                             continue
                     
-                    # If we have tried to adapt 3 times for this step, escalate to Cognitive Core for a scenario switch instead of just an OTM adaptation
+                    failed_metric = step.health_check["checks"][0]["metric"]
+                    val = self.last_kpi_snapshot.get("CellMetrics", {}).get(failed_metric, 0.0)
+
+                    # If we have tried to adapt 4 times for this step, switch scenarios.
                     proc.step_failures += 1
-                    if proc.step_failures >= 3:
+                    if proc.step_failures >= 5:
                         last_tried_scenario = proc.scenario_id
                         self.scenario_failure_count += 1
-                        
-                        failed_metric = step.health_check["checks"][0]["metric"]
-                        val = self.last_kpi_snapshot.get("CellMetrics", {}).get(failed_metric, 0.0)
 
-
-                        
-                        # fallback and human escalation... i dont know if this is needed
-                        if self.scenario_failure_count >= 2:
-                            logger.critical(f"[ESCALATION] Multiple scenarios failed to resolve anomaly on '{failed_metric}'. Applying Safe Baseline and FREEZING.")
-                            await self._publish_procedure_update("procedure_failed", step)
-
-                            await self._record_and_reflect(resolved=False)
-                            
-                            # Wipe the broken procedure
-                            self.active_procedure = None
-                            self.scenario_failure_count = 0  # Reset so it can be clean when humans take over
-                            
-                            # Construct a safe, deterministic OTM with an Autopsy
-                            baseline_otm = {
-                                "version": "1.0",
-                                "objective": {"service": "mbb", "kpi": "DRB_PdcpSduDelayDl", "aggregation": "mean", "unit": "ms", "maximize": False},
-                                "constraints": [
-                                    {"service": "mbb", "kpi": "dl_mcs_max", "operator": "le", "threshold": 20.0, "unit": "", "id": "SAFE_MCS"},
-                                    {"service": "mbb", "kpi": "tx_power_dbm", "operator": "ge", "threshold": 46.0, "unit": "dBm", "id": "SAFE_PWR"}
-                                ],
-                                "metadata": {
-                                    "timescale": "10s_window",
-                                    "procedure_id": None,
-                                    "is_critical_fallback": True,  # Flag for the Optimizer UI formatting
-                                    "adaptation_log": [
-                                        f"CRITICAL CRASH: AI exhausted all attempts to fix '{failed_metric}'.",
-                                        f"Last attempted scenario '{last_tried_scenario}' aborted.",
-                                        f"Fatal Metric: {failed_metric} degraded to {val:.2f}.",
-                                        "Action taken: Reverted to deterministic safe mode (MCS <= 20, Tx Power >= 46).",
-                                        "SYSTEM FROZEN: Autonomous control disabled. Awaiting manual human override."
-                                    ]
-                                }
-                            }
-                            
-                            # Update our active OTM tracker
-                            self.active_otm = baseline_otm
-                            
-                            # Publish the safe constraints directly to the execution layer
-                            asyncio.create_task(self.bus.pub("intent.execute", make_msg("orch", "NEW_TARGET", "v1", self.active_otm)))
-                            
-                            # Lock the system. It will ignore new anomalies until timeout or human intervention.
-                            self.state = IntentState.ESCALATED
-                            self.escalated_at = time.time()
-                            logger.critical("[ORCHESTRATOR] System locked in ESCALATED state. "
-                                            f"Auto-unlock in {self.ESCALATED_TIMEOUT}s or via manual intent.")
-                            
-                            return True
-                            
                         # SCENARIO SWITCH
-                        logger.warning(f"[ORCHESTRATOR] Health check failed 3 times. Escalating '{failed_metric}' issue to Cognitive Core for Scenario Switch.")
+                        logger.warning(f"[ORCHESTRATOR] Health check failed 5 times on '{last_tried_scenario}'. "
+                                       f"Asking Cognitive Core to switch scenarios "
+                                       f"(scenario failure count: {self.scenario_failure_count}).")
                         await self._publish_procedure_update("procedure_failed", step)
                         await self._record_and_reflect(resolved=False)
                         await self._rollback_procedure()
-                        
+
                         self.state = IntentState.THINKING
                         self.thinking_start_time = time.time()
-                        
+
                         asyncio.create_task(self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
                             "type": "scenario_failed",
                             "failed_procedure": last_tried_scenario,  # Tell the LLM what not to use again
@@ -865,18 +820,15 @@ class OrchestratorAgent:
                             "value": val
                         })))
                         return True
-                        
-                    logger.warning(f"[ORCHESTRATOR] Routing health check failure to AI Adaptation (attempt {proc.step_failures}/3).")
+
+                    logger.warning(f"[ORCHESTRATOR] Routing health check failure to AI Adaptation (attempt {proc.step_failures}/4).")
                     
                     # Step back so we re-evaluate this exact health check next loop
                     proc.current_step_idx -= 1
                     
-                    # Extract the failing metric to give the LLM context
-                    failed_metric = step.health_check["checks"][0]["metric"]
-                    val = self.last_kpi_snapshot.get("CellMetrics", {}).get(failed_metric, 0.0)
-                    
-                    # Check if we need to reflect before adapting
-                    if proc.step_failures > 1:
+                    # Check if we have an anomaly to reflect on. 
+                    # If so, ALWAYS reflect before adapting (even on the 1st failure) 
+                    if self.episode_store and self.triggering_anomaly:
                         logger.info("[ORCHESTRATOR] LLM adaptation failed. Triggering Reflexion before re-adapting.")
                         
                         # 1. Trigger the reflection to save the failure into the episode store
@@ -895,7 +847,8 @@ class OrchestratorAgent:
                             "scope": (self.triggering_anomaly or {}).get("scope") or {}
                         }
                     else:
-                        # First failure means the static Knowledge Base defaults failed. No need to reflect, just adapt.
+                        # Fallback for manual/scheduled intents (no anomaly to reflect on)
+                        logger.info("[ORCHESTRATOR] Manual/Scheduled intent failed. Adapting without reflection.")
                         self.state = IntentState.THINKING
                         self.thinking_start_time = time.time()
                         self.e2_acks_received = 0
@@ -909,7 +862,7 @@ class OrchestratorAgent:
                             "scope": (self.triggering_anomaly or {}).get("scope") or {}
                         })))
                         
-                    return True  # Keep procedure active, wait for AI to finish reflecting/thinking
+                    return True
 
             # Skip non-capable steps without health checks
             if not step.ns3_capable or step.otm_fragment is None:

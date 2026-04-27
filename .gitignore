@@ -12,8 +12,12 @@ models/
 logs/
 kpms/
 evaluation_plots/
+results/
 data/
 playbooks/
+results_second/
+extras/
+ue_positions.png
 kpms.csv
 src/core/utils/install_rule.http
 baseline1.csv
