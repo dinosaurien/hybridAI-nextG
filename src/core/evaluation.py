@@ -2,9 +2,10 @@
 """
 Reads KPI data from multiple kpms.csv runs (e.g., 5 baselines, 5 AI runs) and generates
 aggregated evaluation plots:
-  Ablation Bar Charts: Average Latency, Throughput, Recovery Time, Anomalies.
+  - Ablation Bar Charts: Average Latency, Throughput, Recovery Time, Anomalies.
+  - A sample Time-Series Plot of an Energy Intent run showing lag/recovery.
 
-It also creates a summary table in LaTex format for easy inclusion in the thesis.
+It also creates a summary table in LaTex format.
 
 Usage:
   python evaluate_baseline.py \
@@ -52,7 +53,7 @@ def load_kpms_csv(path: str) -> Dict:
             if cell_id.startswith("CELL_") or cell_id == "unknown":
                 entry = {"timestamp": ts}
                 for k, v in row.items():
-                    if k not in ["timestamp", "meid", "cell_id", "node_id", "format"] and v:
+                    if k not in["timestamp", "meid", "cell_id", "node_id", "format"] and v:
                         try:
                             entry[k] = float(v)
                         except ValueError:
@@ -85,7 +86,7 @@ def analyze_recovery_times(data: Dict, metric: str = "DRB_PdcpSduDelayDl", thres
     """Detect degradations and measure time-to-recover."""
     vals_with_ts = [(r["timestamp"], r[metric]) for r in data["cell"] if metric in r]
     if not vals_with_ts: 
-        return[], 0
+        return [], 0
     
     events =[]
     unrecovered = 0
@@ -128,7 +129,8 @@ def compute_run_metrics(data: Dict) -> dict:
     metrics["tx_power_mean"] = np.mean(tx_vals) if tx_vals else np.nan
     
     # MCS Average
-    mcs_vals =[r["mcs_dl_avg"] for r in data["cell"] if "mcs_dl_avg" in r]
+    mcs_vals =[r.get("mcs_dl_avg", r.get("dl_mcs_max", np.nan)) for r in data["cell"] if "mcs_dl_avg" in r or "dl_mcs_max" in r]
+    mcs_vals =[v for v in mcs_vals if not np.isnan(v)]
     metrics["mcs_mean"] = np.mean(mcs_vals) if mcs_vals else np.nan
     
     # PRB Usage
@@ -166,7 +168,7 @@ def print_summary_table(categories: Dict[str, List[dict]]):
     for m_key, m_name in metrics:
         row = [m_name]
         for lbl, runs in categories.items():
-            vals = [r[m_key] for r in runs if not np.isnan(r.get(m_key, np.nan))]
+            vals =[r[m_key] for r in runs if not np.isnan(r.get(m_key, np.nan))]
             if vals:
                 mean_val = np.mean(vals)
                 std_val = np.std(vals)
@@ -205,13 +207,14 @@ def print_summary_table(categories: Dict[str, List[dict]]):
     
     for row in table_rows:
         # Escape the % sign for LaTeX
-        safe_row = [str(item).replace("%", "\\%") for item in row]
+        safe_row =[str(item).replace("%", "\\%") for item in row]
         print(" & ".join(safe_row) + " \\\\")
         
     print("\\bottomrule")
     print("\\end{tabular}")
     print("\\end{table}")
     print("==================================================\n")
+
 
 def plot_aggregated_bars(categories: Dict[str, List[dict]], out_dir: str):
     """Plot bar charts with error bars for the ablation study."""
@@ -257,9 +260,92 @@ def plot_aggregated_bars(categories: Dict[str, List[dict]], out_dir: str):
     plt.close()
     print(f"Saved Ablation Bar Charts: {path}")
 
+
+def plot_energy_timeseries(data: Dict, out_dir: str, file_name: str = "sample_energy_intent.png"):
+    """Plot a single simulation run to show lag and recovery visually over time."""
+    plt = _import_plt()
+    
+    # Extract latency
+    lat_ts =[r["timestamp"] for r in data["cell"] if "DRB_PdcpSduDelayDl" in r]
+    lat_vals = [r["DRB_PdcpSduDelayDl"] for r in data["cell"] if "DRB_PdcpSduDelayDl" in r]
+    
+    # Extract Tx Power & MCS
+    act_ts = [r["timestamp"] for r in data["cell"] if "tx_power_dbm" in r]
+    tx_vals = [r["tx_power_dbm"] for r in data["cell"] if "tx_power_dbm" in r]
+    mcs_vals =[r.get("mcs_dl_avg", r.get("dl_mcs_max", np.nan)) for r in data["cell"]]
+    mcs_vals =[v for v in mcs_vals if not np.isnan(v)]
+    
+    # Compute Aggregate Throughput Over Time
+    thp_by_ts = defaultdict(float)
+    for uid, rows in data["ue"].items():
+        for r in rows:
+            if "UE_DRB_UEThpDl_UEID" in r:
+                thp_by_ts[r["timestamp"]] += r["UE_DRB_UEThpDl_UEID"]
+    
+    thp_ts = sorted(thp_by_ts.keys())
+    thp_vals = [thp_by_ts[t] for t in thp_ts]
+
+    if not lat_ts:
+        print("Not enough data to plot timeseries for the sample run.")
+        return
+
+    t0 = lat_ts[0]
+    lat_mins =[(t - t0).total_seconds() / 60.0 for t in lat_ts]
+    thp_mins =[(t - t0).total_seconds() / 60.0 for t in thp_ts]
+    act_mins =[(t - t0).total_seconds() / 60.0 for t in act_ts]
+    
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    fig.suptitle("System Dynamics: Energy Intent Mode (Lag & AI Recovery)", fontsize=16, fontweight="bold")
+    
+    # Latency Plot
+    ax1 = axes[0]
+    ax1.plot(lat_mins, lat_vals, color="tab:red", alpha=0.8, linewidth=1.5, label="DL Latency")
+    ax1.axhline(y=40, color="black", linestyle="--", alpha=0.7, label="Anomaly Threshold (40ms)")
+    ax1.set_ylabel("Latency (ms)", fontweight="bold")
+    ax1.set_title("Network Latency Spikes (Triggering AI Adaptation)", fontsize=12)
+    ax1.legend(loc="upper left")
+    ax1.grid(True, alpha=0.3)
+    
+    # Control Actions (Tx Power & MCS)
+    ax2 = axes[1]
+    ax2.plot(act_mins, tx_vals, color="tab:orange", linewidth=2, label="Tx Power (dBm)")
+    ax2.set_ylabel("Tx Power (dBm)", fontweight="bold")
+    ax2.set_ylim(20, 50)
+    
+    ax2_twin = ax2.twinx()
+    # Align lengths just in case
+    min_len = min(len(act_mins), len(mcs_vals))
+    ax2_twin.step(act_mins[:min_len], mcs_vals[:min_len], color="tab:purple", linewidth=2, linestyle="-.", label="MCS")
+    ax2_twin.set_ylabel("Modulation (MCS)", fontweight="bold")
+    ax2_twin.set_ylim(0, 30)
+    
+    ax2.set_title("AI Control Actions (Power Scaling & MCS Adjustments)", fontsize=12)
+    
+    # Combine legends for twin axis
+    lines, labels = ax2.get_legend_handles_labels()
+    lines2, labels2 = ax2_twin.get_legend_handles_labels()
+    ax2.legend(lines + lines2, labels + labels2, loc="upper left")
+    ax2.grid(True, alpha=0.3)
+    
+    # 3. Throughput
+    ax3 = axes[2]
+    ax3.plot(thp_mins, thp_vals, color="tab:blue", alpha=0.9, linewidth=1.5, label="Aggregate Throughput")
+    ax3.set_ylabel("Throughput (kbps)", fontweight="bold")
+    ax3.set_xlabel("Time (Minutes)", fontweight="bold")
+    ax3.set_title("Total Downlink Throughput Under Adaptive Control", fontsize=12)
+    ax3.legend(loc="upper left")
+    ax3.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    path = os.path.join(out_dir, file_name)
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved Sample Energy Time-Series: {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Aggregated Thesis Evaluator for 5G AI Architecture")
-    parser.add_argument("--baseline", nargs='+', help="List of baseline CSV files (e.g., baseline1.csv baseline2.csv)")
+    parser.add_argument("--baseline", nargs='+', help="List of baseline CSV files")
     parser.add_argument("--managed", nargs='+', help="List of AI (No Reflexion) CSV files")
     parser.add_argument("--reflexion", nargs='+', help="List of AI (With Reflexion) CSV files")
     parser.add_argument("--energy", nargs='+', help="List of AI (Energy Intent) CSV files")
@@ -281,13 +367,25 @@ def main():
         categories["AI (No Reflexion)"] =[compute_run_metrics(load_kpms_csv(f)) for f in args.managed if os.path.exists(f)]
     if args.reflexion:
         categories["AI (Reflexion)"] =[compute_run_metrics(load_kpms_csv(f)) for f in args.reflexion if os.path.exists(f)]
+    
+    # Process Energy Intent
     if args.energy:
-        categories["Energy Intent"] =[compute_run_metrics(load_kpms_csv(f)) for f in args.energy if os.path.exists(f)]
+        energy_raw_data =[]
+        for f in args.energy:
+            if os.path.exists(f):
+                energy_raw_data.append(load_kpms_csv(f))
+        
+        categories["Energy Intent"] =[compute_run_metrics(data) for data in energy_raw_data]
+        
+        # Plot time-series visualization for the FIRST energy intent run
+        if energy_raw_data:
+            print("Plotting sample time-series for the first Energy Intent run...")
+            plot_energy_timeseries(energy_raw_data[0], args.out_dir, "energy_intent_timeseries_sample.png")
 
-    # Print Text Summary
+    # Print Text Summary (100% Original Code restored)
     print_summary_table(categories)
 
-    # Generate Plots
+    # Generate Bar Plots
     plot_aggregated_bars(categories, args.out_dir)
     
     print("\nEvaluation complete! Add these plots to your Results section.")

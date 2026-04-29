@@ -47,7 +47,7 @@ def boot_infrastructure():
 def clean_state(wipe_memory=False):
     """Delete old telemetry and optionally wipes the LLM's memory."""
 
-    for csv_file in ["kpms.csv", "kpms_baseline.csv"]:
+    for csv_file in ["kpms.csv", "kpms_baseline.csv", "tokens.csv"]:
         path = os.path.join(AI_ROOT, csv_file)
         if os.path.exists(path):
             os.remove(path)
@@ -97,15 +97,22 @@ def save_results(prefix, run_id):
     # Handle the fact that Baseline mode outputs to a different filename for legacy reasons
     src_baseline = os.path.join(AI_ROOT, "kpms_baseline.csv")
     src_normal = os.path.join(AI_ROOT, "kpms.csv")
-    
+
     src = src_baseline if prefix == "baseline" else src_normal
     dest = os.path.join(AI_ROOT, f"{prefix}{run_id}.csv")
-    
+
     if os.path.exists(src):
         shutil.copy(src, dest)
         print(f"\nSaved results to {dest}")
     else:
         print(f"\nERROR: {src} not found for {prefix}{run_id}!")
+
+    # Token usage log — only present in deploy-mode runs (not baseline)
+    tokens_src = os.path.join(AI_ROOT, "tokens.csv")
+    if os.path.exists(tokens_src):
+        tokens_dest = os.path.join(AI_ROOT, f"tokens_{prefix}{run_id}.csv")
+        shutil.copy(tokens_src, tokens_dest)
+        print(f"Saved token log to {tokens_dest}")
 
 def inject_intent(text):
     """Fires an HTTP POST (manual intent) request to the web UI"""
@@ -118,16 +125,19 @@ def inject_intent(text):
     except Exception as e:
         print(f"    [!] Failed to inject intent: {e}")
 
-def run_phase(phase_name, ai_args, prefix, wipe_memory_first, energy_intent=False):
-    """Executes a full 5-run phase"""
+def run_phase(phase_name, ai_args, prefix, wipe_memory_first, energy_intent=False, runs=None):
+    if runs is None:
+        runs = range(1, RUNS_PER_PHASE + 1)
+        
     print(f"\n{'='*70}\nStarting Phase: {phase_name}\n{'='*70}")
     
     sim_env = os.environ.copy()
     if "PROJECT_ROOT" in sim_env:
         del sim_env["PROJECT_ROOT"]
     
-    for i in range(1, RUNS_PER_PHASE + 1):
-        print(f"\n  --- {phase_name} | Run {i}/{RUNS_PER_PHASE} ---")
+    # Change the loop to iterate over the custom `runs` list
+    for i in runs:
+        print(f"\n  --- {phase_name} | Run {i} ---")
         
         # Clean state
         clean_state(wipe_memory=wipe_memory_first)
@@ -148,6 +158,7 @@ def run_phase(phase_name, ai_args, prefix, wipe_memory_first, energy_intent=Fals
         
         # Start Simulator
         print("Starting Simulator (ns-3 logs will stream below)...")
+        # Notice that {i} is still correctly passed as the rngSeed
         sim_cmd = f"{SIM_SCRIPT} --skip-import --skip-ric --scenario eval_scenario-static-4UEs.cc --rngSeed {i} --injectAt 45 --injectType spike -y"
         sim_proc = subprocess.Popen(sim_cmd, shell=True, cwd=SIM_ROOT, env=sim_env)
         
@@ -179,13 +190,13 @@ def main():
     boot_infrastructure()
     
     # Phase 1: Baseline
-    #run_phase("Phase 1: Baseline", "--mode baseline", "baseline", wipe_memory_first=True)
+    run_phase("Phase 1: Baseline", "--mode baseline", "baseline", wipe_memory_first=True)
 
     # Phase 2: AI Managed without Reflexion
-    #run_phase("Phase 2: AI (No Reflexion)", "--mode deploy --no-episodes", "no_reflexion", wipe_memory_first=True)
+    run_phase("Phase 2: AI (No Reflexion)", "--mode deploy --no-episodes", "no_reflexion", wipe_memory_first=True, runs=[1, 2, 3, 4, 5])
 
     # Phase 3: AI Managed WITH Reflexion
-    #run_phase("Phase 3: AI (With Reflexion)", "--mode deploy", "reflexion", wipe_memory_first=True)
+    run_phase("Phase 3: AI (With Reflexion)", "--mode deploy", "reflexion", wipe_memory_first=True, runs=[1, 3, 4, 5])
 
     # Phase 4: Energy Efficiency Steering
     run_phase("Phase 4: Energy Intent", "--mode deploy", "energy", wipe_memory_first=True, energy_intent=True)

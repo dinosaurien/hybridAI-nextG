@@ -17,6 +17,7 @@ data/
 playbooks/
 results_second/
 extras/
+final_results/
 ue_positions.png
 kpms.csv
 src/core/utils/install_rule.http

@@ -19,10 +19,11 @@ from core.control_layer.xapp_adapter import XAppTCPServer
 from core.telemetry_layer.telemetry_agent import TelemetryAgent
 from core.brain.cognitive_agent import CognitiveAgent
 from core.brain.episode_store import EpisodeStore
+from core.brain.token_logger import TokenLogger
 
 logger = logging.getLogger(__name__)
 
-# Static expert-tuned OTM for fixed-otm evaluation mode.
+# Static OTMs for fixed-otm evaluation mode.
 # Represents the simplest non-trivial control strategy:
 # cap MCS to reduce retransmissions, boost TX power for coverage.
 FIXED_OTM = {
@@ -79,22 +80,18 @@ async def run_baseline_logging(tcp_server, args):
     logger.info("=" * 50)
     await wait_forever()
 
-
+# Used before for training the RL pipeline but not used anymore, maybe useful for future work.
 async def run_fixed_otm(tcp_server, args):
     """Fixed-OTM mode: static expert rules with deterministic constraint execution.
 
     No LLM, no anomaly detection, no orchestrator FSM.
     A predefined OTM is published at startup and periodically re-published.
-    The ConstraintExecutor applies it. KPIs are logged for comparison.
-    This is the "rule-based expert" evaluation baseline.
     """
     bus = MemBus()
     tcp_server.bus = bus
 
     web_server = UnifiedWebServer(bus, port=args.web_port)
     actuator = ActuatorAgent(bus, cell_to_node_map=tcp_server.cell_to_node_map)
-    # objective_aware=False: static expert rules use constraint thresholds as-is,
-    # no objective-driven biasing. This is the "rule-based" evaluation baseline.
     constraint_executor = ConstraintExecutor(bus, objective_aware=False)
 
     async def publish_fixed_otm():
@@ -141,6 +138,10 @@ async def run_deploy(tcp_server, args):
         logger.info("[DEPLOY] Episodic memory (Reflexion) ENABLED.")
     else:
         logger.info("[DEPLOY] Episodic memory DISABLED (--no-episodes ablation mode).")
+
+    # Per-call LLM token usage log, written next to kpms.csv. Used for
+    # comparing token cost between Reflexion-on / Reflexion-off runs.
+    token_logger = TokenLogger(path=args.tokens_csv)
 
     # Start network-facing services first so KPIs aren't dropped during LLM load
     web_server = UnifiedWebServer(bus, port=args.web_port)
@@ -191,7 +192,7 @@ async def run_deploy(tcp_server, args):
     # Load LLM in background thread so the event loop keeps processing KPIs
     loop = asyncio.get_running_loop()
     cognitive_agent = await loop.run_in_executor(
-        None, lambda: CognitiveAgent(bus, kb, episode_store=episode_store)
+        None, lambda: CognitiveAgent(bus, kb, episode_store=episode_store, token_logger=token_logger)
     )
     tasks.append(asyncio.create_task(cognitive_agent.run()))
     logger.info("Cognitive agent loaded — full pipeline active.")
@@ -219,6 +220,8 @@ async def main():
     parser.add_argument("--minirocket-gnb-model", default="models/minirocket_xapp_gnb.joblib")
     parser.add_argument("--minirocket-ue-model", default="models/minirocket_xapp_ue.joblib")
     parser.add_argument("--log-level", type=str, default="INFO")
+    parser.add_argument("--tokens-csv", type=str, default="tokens.csv",
+                        help="Per-call LLM token usage CSV (deploy mode only).")
 
     args = parser.parse_args()
 

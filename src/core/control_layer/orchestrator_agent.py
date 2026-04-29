@@ -768,9 +768,10 @@ class OrchestratorAgent:
 
             # Health check step: evaluate immediately against latest telemetry
             if step.health_check:
-                passed, details = self._evaluate_health_check(step)
+                passed, details, failed_metric = self._evaluate_health_check(step)
                 event = "health_check_passed" if passed else "health_check_failed"
                 await self._publish_procedure_update(event, step)
+                
                 if passed:
                     ok_msg = (f"[{now_str}] Health check '{step.name}' PASSED: {details}")
                     logger.info(f"[ORCHESTRATOR] {ok_msg}")
@@ -789,12 +790,21 @@ class OrchestratorAgent:
                             branch_msg = (f"[{now_str}] Branching to alternative step '{step.on_fail_goto}'")
                             logger.info(f"[ORCHESTRATOR] {branch_msg}")
                             self._append_to_active_log(branch_msg)
-                            proc.current_step_idx = target_idx - 1  # -1 because loop increments
+                            proc.current_step_idx = target_idx - 1
                             proc.branched_to = True
                             continue
                     
-                    failed_metric = step.health_check["checks"][0]["metric"]
-                    val = self.last_kpi_snapshot.get("CellMetrics", {}).get(failed_metric, 0.0)
+                    val = self.last_kpi_snapshot.get("CellMetrics", {}).get(failed_metric)
+                    if val is None:
+                        ues = self.last_kpi_snapshot.get("UEMetrics", [])
+                        ue_vals = [float(ue[failed_metric]) for ue in ues if failed_metric in ue and ue.get(failed_metric) is not None]
+                        val = sum(ue_vals) / len(ue_vals) if ue_vals else 0.0
+                    else:
+                        val = float(val)
+
+                    # Track the root-cause anomaly so Reflexion looks up the correct task key
+                    original_anomaly_metric = self.triggering_anomaly.get("metric") if self.triggering_anomaly else failed_metric
+                    original_anomaly_value = self.last_metric_value if self.last_metric_value is not None else val
 
                     # If we have tried to adapt 4 times for this step, switch scenarios.
                     proc.step_failures += 1
@@ -808,7 +818,9 @@ class OrchestratorAgent:
                                        f"(scenario failure count: {self.scenario_failure_count}).")
                         await self._publish_procedure_update("procedure_failed", step)
                         await self._record_and_reflect(resolved=False)
-                        await self._rollback_procedure()
+                        
+                        # FIX 4: Preserve the anomaly state so the new procedure knows what to track
+                        await self._rollback_procedure(keep_anomaly_state=True)
 
                         self.state = IntentState.THINKING
                         self.thinking_start_time = time.time()
@@ -816,8 +828,8 @@ class OrchestratorAgent:
                         asyncio.create_task(self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
                             "type": "scenario_failed",
                             "failed_procedure": last_tried_scenario,  # Tell the LLM what not to use again
-                            "metric": failed_metric,
-                            "value": val
+                            "metric": original_anomaly_metric,        # Tell LLM to fix the ROOT CAUSE
+                            "value": original_anomaly_value
                         })))
                         return True
 
@@ -827,21 +839,20 @@ class OrchestratorAgent:
                     proc.current_step_idx -= 1
                     
                     # Check if we have an anomaly to reflect on. 
-                    # If so, ALWAYS reflect before adapting (even on the 1st failure) 
                     if self.episode_store and self.triggering_anomaly:
                         logger.info("[ORCHESTRATOR] LLM adaptation failed. Triggering Reflexion before re-adapting.")
                         
-                        # 1. Trigger the reflection to save the failure into the episode store
+                        # Trigger the reflection to save the failure into the episode store
                         await self._record_and_reflect(resolved=False)
                         
-                        # 2. Enter the new REFLECTING state so the main loop waits
+                        # Enter the new REFLECTING state so the main loop waits
                         self.state = IntentState.REFLECTING
                         self.reflecting_start_time = time.time()
                         self.e2_acks_received = 0
                         
-                        # 3. Store the context so the main loop can send the adapt_otm request AFTER reflection finishes
                         self.pending_adapt_context = {
                             "metric": failed_metric,
+                            "anomaly_metric": original_anomaly_metric,
                             "value": val,
                             "previous_otm": self.active_otm,
                             "scope": (self.triggering_anomaly or {}).get("scope") or {}
@@ -856,7 +867,8 @@ class OrchestratorAgent:
                         # Let LLM adapt the OTM immediately
                         asyncio.create_task(self.bus.pub("ai.request", make_msg("ai.request", "REQ", "v1", {
                             "type": "adapt_otm", 
-                            "metric": failed_metric,
+                            "metric": failed_metric,                     # The metric that failed the check
+                            "anomaly_metric": original_anomaly_metric,   # Pass root cause for memory lookup
                             "value": val,
                             "previous_otm": self.active_otm,
                             "scope": (self.triggering_anomaly or {}).get("scope") or {}
@@ -891,7 +903,8 @@ class OrchestratorAgent:
             await self._publish_procedure_update("step_activated", step)
             return True
 
-        return False  # No more steps
+        return False 
+    
 
     def _merge_step_into_otm(self, step):
         if not self.active_otm or not step.otm_fragment:
@@ -941,39 +954,36 @@ class OrchestratorAgent:
     def _evaluate_health_check(self, step: ProcedureStep) -> tuple:
         """Evaluate health check conditions against a 10-second rolling telemetry window.
 
-        Returns (passed: bool, details: str).
+        Returns (passed: bool, details: str, failed_metric: str).
         """
-        checks = list(step.health_check.get("checks", []))
+        checks = list(step.health_check.get("checks",[]))
         anomaly_check = self._anomaly_metric_check()
         if anomaly_check is not None and not any(
                 c.get("metric") == anomaly_check["metric"] for c in checks):
             checks.append(anomaly_check)
         now = time.time()
         
-        # Ensure we are only looking at data from the last 10 seconds
-        valid_history = [raw for t, raw in self.kpi_history if now - t <= self.HEALTH_CHECK_WINDOW]
+        valid_history =[raw for t, raw in self.kpi_history if now - t <= self.HEALTH_CHECK_WINDOW]
         
         if not valid_history:
-            return False, "FAILED: No telemetry data available in the 10-second window."
+            return False, "FAILED: No telemetry data available.", checks[0]["metric"] if checks else "unknown"
 
-        results = []
+        results =[]
         all_passed = True
+        failed_metrics =[] # Track what actually failed
         
         for chk in checks:
             metric = chk["metric"]
             op = chk["operator"]
             threshold = float(chk["threshold"])
 
-            # Collect all values for this metric over the 10s window
-            window_values = []
+            window_values =[]
             
             for raw in valid_history:
                 cell = raw.get("CellMetrics", {})
-                ues = raw.get("UEMetrics", [])
+                ues = raw.get("UEMetrics",[])
                 
                 val = cell.get(metric)
-                
-                # If not a cell metric, average across all UEs for this specific timestamp
                 if val is None and ues:
                     ue_vals = []
                     for ue in ues:
@@ -988,34 +998,29 @@ class OrchestratorAgent:
                 if val is not None:
                     window_values.append(float(val))
 
-            # --- Evaluation ---
             if not window_values:
-                # FIX applied here: NO DATA triggers a failure instead of passing
                 results.append(f"{metric}: NO DATA (Connection Dropped?)")
                 all_passed = False
+                failed_metrics.append(metric)
                 continue
 
-            # Calculate the mean over the health check window
             avg_val = sum(window_values) / len(window_values)
 
-            if op == "le":
-                ok = avg_val <= threshold
-            elif op == "lt":
-                ok = avg_val < threshold
-            elif op == "ge":
-                ok = avg_val >= threshold
-            elif op == "gt":
-                ok = avg_val > threshold
-            else:
-                ok = False
+            if op == "le": ok = avg_val <= threshold
+            elif op == "lt": ok = avg_val < threshold
+            elif op == "ge": ok = avg_val >= threshold
+            elif op == "gt": ok = avg_val > threshold
+            else: ok = False
 
             status = "OK" if ok else "FAIL"
             results.append(f"{metric}={avg_val:.2f}avg (N={len(window_values)}) {op} {threshold} -> {status}")
             
             if not ok:
                 all_passed = False
+                failed_metrics.append(metric)
 
-        return all_passed, "; ".join(results) if results else "no checks defined"
+        primary_failed_metric = failed_metrics[0] if failed_metrics else (checks[0]["metric"] if checks else "unknown")
+        return all_passed, "; ".join(results) if results else "no checks defined", primary_failed_metric
 
     @staticmethod
     def _find_step_index_by_name(proc: ActiveProcedure, step_name: str):
@@ -1041,7 +1046,7 @@ class OrchestratorAgent:
 
         self.active_procedure = None
 
-    async def _rollback_procedure(self):
+    async def _rollback_procedure(self, keep_anomaly_state: bool = False):
         """Rollback to pre-procedure OTM after repeated failures."""
         proc = self.active_procedure
         if not proc:
@@ -1062,8 +1067,10 @@ class OrchestratorAgent:
             self.active_otm = None
 
         self.active_procedure = None
-        self._clear_anomaly_state()
-        self.state = IntentState.MONITORING
+        
+        if not keep_anomaly_state:
+            self._clear_anomaly_state()
+            self.state = IntentState.MONITORING
 
     def _append_to_active_log(self, entry: str):
         """Append an entry to the active OTM's adaptation_log."""
