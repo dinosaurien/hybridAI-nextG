@@ -29,8 +29,8 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Shinn et al. §3: "Omega is usually set to 1-3 to adhere to max context LLM
-# limitations." AlfWorld experiments use 3. We follow the same default.
+# Shinn et al.: "Omega is usually set to 1-3 to adhere to max context LLM
+# limitations." AlfWorld experiments use 3.
 DEFAULT_OMEGA = 3
 
 # Hard cap per task bucket to prevent unbounded growth on disk. Reflections
@@ -39,10 +39,7 @@ DEFAULT_OMEGA = 3
 PER_TASK_HARD_CAP = 20
 
 
-# ====================================================================== #
-#  Reflexion memory (Shinn et al., 2023)                                  #
-# ====================================================================== #
-
+#  Reflexion memory (based on Shinn et al., 2023)
 class ReflexionMemory:
     """Per-task verbal memory, aligned with Shinn et al. Algorithm 1.
 
@@ -71,20 +68,16 @@ class ReflexionMemory:
 
         self._load_from_disk()
 
-    # ------------------------------------------------------------------ #
-    #  Task scoping                                                       #
-    # ------------------------------------------------------------------ #
 
+    # Task scoping
     @staticmethod
     def task_key(anomaly: dict) -> Tuple[str, str]:
         metric = anomaly.get("metric", "unknown") or "unknown"
         cell = (anomaly.get("scope") or {}).get("cell_id", "unknown") or "unknown"
         return (metric, cell)
 
-    # ------------------------------------------------------------------ #
-    #  Persistence                                                        #
-    # ------------------------------------------------------------------ #
 
+    # Persistence on disk
     def _load_from_disk(self):
         if not self.store_path.exists():
             logger.info("[REFLEXION_MEM] No prior episodes on disk. Starting fresh.")
@@ -124,9 +117,7 @@ class ReflexionMemory:
 
     def _rewrite_disk(self):
         """Atomically rewrite the JSONL file (used when a reflection is
-        attached or the per-task cap is enforced). Same-directory temp file
-        plus os.replace guarantees the file is never seen in a truncated
-        state — either the old contents or the new contents are present.
+        attached or the per-task cap is enforced).
         """
         fd, tmp_path = tempfile.mkstemp(
             dir=str(self.store_path.parent), suffix=".tmp"
@@ -144,21 +135,17 @@ class ReflexionMemory:
                 pass
             raise
 
-    # ------------------------------------------------------------------ #
-    #  Record a trial                                                     #
-    # ------------------------------------------------------------------ #
 
+    # Record a trial
     def record_trial(self,
                      anomaly: dict,
                      otm: Optional[dict],
                      outcome: dict) -> Optional[str]:
-        """Persist a completed trial.
-
-        Returns the episode id ONLY if the trial failed — the caller uses
+        """
+        Returns the episode id ONLY if the trial failed, the caller uses
         that id to request a reflection. Successful trials are still stored
         (for audit / metrics) but no reflection is generated, matching the
-        canonical Reflexion loop where Msr is invoked when the evaluator
-        reports failure.
+        canonical Reflexion loop.
         """
         otm = otm or {}
         task = self.task_key(anomaly)
@@ -219,13 +206,11 @@ class ReflexionMemory:
         logger.info(f"[REFLEXION_MEM] Recorded trial {episode['id'][:8]} "
                     f"(task={task}, resolved={resolved}).")
 
-        # Canonical Reflexion: reflect only on failure.
+        # reflect only on failure.
         return episode["id"] if not resolved else None
 
-    # ------------------------------------------------------------------ #
-    #  Attach reflection                                                  #
-    # ------------------------------------------------------------------ #
 
+    # Attach reflection
     def add_reflection(self, episode_id: str, reflection: str):
         with self._lock:
             entry = self._id_index.get(episode_id)
@@ -242,10 +227,8 @@ class ReflexionMemory:
             self._rewrite_disk()
         logger.info(f"[REFLEXION_MEM] Reflection attached to episode {episode_id[:8]}.")
 
-    # ------------------------------------------------------------------ #
-    #  Retrieval — tail-take of last Omega reflections                    #
-    # ------------------------------------------------------------------ #
 
+    # Retrieval: tail-take of last Omega reflections
     def get_recent_reflections(self, anomaly: dict) -> List[str]:
         """Return up to Omega most recent reflections for this task.
 
@@ -275,10 +258,8 @@ class ReflexionMemory:
                     latest_ts = ts
             return latest
 
-    # ------------------------------------------------------------------ #
-    #  Prompt formatting                                                  #
-    # ------------------------------------------------------------------ #
 
+    # Prompt formatting
     @staticmethod
     def format_reflections_for_prompt(reflections: List[str]) -> str:
         """Render tail-taken reflections as a compact block for the LLM."""
@@ -290,22 +271,10 @@ class ReflexionMemory:
         return "\n".join(lines)
 
 
-# ====================================================================== #
-#  Backward-compat adapter                                                #
-# ====================================================================== #
-
+# Wraps ReflexionMemory.record_trial() to return an episode id even on successful trials. 
+# The Orchestrator needs an id for audit logging regardless of outcome, record_trial() only returns one on failure.
 class EpisodeStore(ReflexionMemory):
-    """Thin alias preserving the import path used by main.py / orchestrator /
-    cognitive_agent. Exposes a small shim over the Reflexion API so the
-    existing call sites (record / add_reflection) keep working.
-    """
-
     def record(self, anomaly: dict, otm: dict, outcome: dict) -> str:
-        """Legacy signature. Always returns an episode id (success or fail).
-        The caller decides whether to request a reflection — for the
-        canonical loop, only publish ai.reflect when outcome['resolved']
-        is False.
-        """
         ep_id_if_failed = self.record_trial(anomaly, otm, outcome)
         if ep_id_if_failed is not None:
             return ep_id_if_failed

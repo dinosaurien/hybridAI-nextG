@@ -15,9 +15,8 @@ from llama_cpp import Llama
 
 logger = logging.getLogger(__name__)
 
-# Intent-feasibility vocabulary: only accept manual intents whose text hits
-# at least one scenario keyword. Derived from the RDF scenarios in
-# knowledge_base.py. 
+# Only accept manual intents whose text hits at least one scenario keyword. 
+# Derived from the RDF scenarios in knowledge_base.py. 
 MANUAL_INTENT_VOCAB = {
     "latency", "delay", "congestion", "lag", "slow",
     "throughput", "bandwidth", "data rate", "speed",
@@ -38,12 +37,8 @@ def _manual_intent_in_vocabulary(text: str) -> bool:
     return any(kw in lowered for kw in MANUAL_INTENT_VOCAB)
 
 
-# Canonical constraint identities — the ONLY ids the LLM is allowed to
-# adapt. Constraint identities flow from KB procedure catalog → orchestrator.
-# The LLM's output is gated through _sanitize_llm_constraints: it may update
-# thresholds of existing canonical ids (or add missing ones during merge),
-# but any hallucinated id, old {parameter, value} shape, or non-actuatable
-# kpi is discarded at the boundary.
+# Allowed canonical constraint IDs for the LLM. _sanitize_llm_constraints updates 
+# thresholds for these, but drops any hallucinated, legacy, or non-actuatable KPIs.
 CANONICAL_CONSTRAINT_IDS = {"PROC_MCS", "PROC_TXPOW"}
 _ID_TO_KPI = {"PROC_MCS": "dl_mcs_max", "PROC_TXPOW": "tx_power_dbm"}
 _ID_TO_OPERATOR = {"PROC_MCS": "le", "PROC_TXPOW": "ge"}
@@ -90,6 +85,7 @@ def _sanitize_llm_constraints(base_constraints: list, llm_constraints: list) -> 
             by_id[cid]["adapted_by"] = "cognitive_llm"
             
             # The LLM must be able to change a floor to a ceiling
+            # These are fossils from when actiation was RL based
             if "operator" in c:
                 by_id[cid]["operator"] = c["operator"]
                 
@@ -133,7 +129,7 @@ class CognitiveAgent:
         self.episode_store = episode_store
         self.token_logger = token_logger
         self.executor = ThreadPoolExecutor(max_workers=1)
-        self._model_lock = threading.Lock()  # Serialize all Llama model access
+        self._model_lock = threading.Lock()
         self.model = None
 
         try:

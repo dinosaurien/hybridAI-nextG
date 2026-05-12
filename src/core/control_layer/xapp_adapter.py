@@ -22,6 +22,7 @@ sys.path.insert(0, str(THIS_DIR.parent.parent.parent))
 
 logger = logging.getLogger(__name__)
 
+# Mainly inherited logic, but reformatted to be in a separate file instead of in the Main function.
 class XAppKPIAdapter:
     """Converts xApp KPI format to internal format expected by RLObserver."""
 

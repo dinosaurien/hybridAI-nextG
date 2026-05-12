@@ -8,6 +8,10 @@ from core.bus.messages import make_msg
 
 logger = logging.getLogger(__name__)
 
+# The front-end HTML and CSS/JS is based on the https://github.com/StartBootstrap/startbootstrap-sb-admin repo
+# Although heavily modified to match requirements of this work, the original license is MIT so this is fine for our needs.
+
+
 class WebBusAdapter:
     """Sends user intents from UI to the MemBus."""
     def __init__(self, bus: MemBus):

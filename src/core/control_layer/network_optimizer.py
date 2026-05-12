@@ -7,8 +7,10 @@ logger = logging.getLogger(__name__)
 
 class NetworkOptimizer:
     """
-    Acts as the bridge between the Cognitive Core (LLM) and the Constraint Executor.
+    Acts as the bridge between the Cognitive Agent and the Constraint Executor.
     Takes declarative OTMs, formats them for the UI, and pushes them to the execution layer.
+    Name is a bit misleading, TODO: Reformat the naming of this file and the constraint executor.
+    # (names are renmants from when RL was experimented with as optimization method, but logic has changed and these are now misleading)
     """
     def __init__(self, bus):
         self.bus = bus

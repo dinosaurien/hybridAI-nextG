@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Token Cost & Cognitive Overhead Plotter
+Token Cost & Inference Time Plotter
 
 Reads tokens.csv files from the evaluation runs and plots:
 1. Context Bloat (Prompt tokens vs Adaptation Attempt)
-2. Cognitive Delay (Inference Latency Breakdown)
+2. Inference Time Delay
 
 Usage:
   python plot_token_cost.py \
@@ -100,27 +100,28 @@ def plot_cognitive_overhead(datasets: dict, out_dir: str):
     plt = _import_plt()
     os.makedirs(out_dir, exist_ok=True)
     
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    
+    fig, axes = plt.subplots(1, 2, figsize=(15, 7))
+
     # ---------------------------------------------------------
     # Panel 1: Context Bloat (Line Chart - Averages Only)
     # ---------------------------------------------------------
     ax1 = axes[0]
     colors = {"AI (No Reflexion)": "tab:blue", "AI (Reflexion)": "tab:green", "Energy Intent": "tab:purple"}
-    
+
     for label, data in datasets.items():
         if not data: continue
         seqs = extract_adaptation_sequences(data)
         x, means = calculate_bloat(seqs)
-        
+
         if x:
             ax1.plot(x, means, marker='o', linewidth=2.5, markersize=8, label=label, color=colors.get(label, "black"))
-            
+
     ax1.set_xticks([1, 2, 3, 4, 5])
-    ax1.set_xlabel("Adaptation Attempt (Consecutive Failures)", fontweight="bold")
-    ax1.set_ylabel("Prompt Context Size (Tokens)", fontweight="bold")
-    ax1.set_title("Context Growth over Adaptation Cycles", fontsize=13)
-    ax1.legend()
+    ax1.set_xlabel("Adaptation Attempt (Consecutive Failures)", fontweight="bold", fontsize=14)
+    ax1.set_ylabel("Prompt Context Size (Tokens)", fontweight="bold", fontsize=14)
+    ax1.set_title("Context Growth over Adaptation Cycles", fontweight="bold", fontsize=18, pad=15)
+    ax1.tick_params(axis="both", labelsize=15)
+    ax1.legend(fontsize=14)
     ax1.grid(True, linestyle="--", alpha=0.6)
 
     # ---------------------------------------------------------
@@ -130,30 +131,31 @@ def plot_cognitive_overhead(datasets: dict, out_dir: str):
     labels = list(datasets.keys())
     dec_times = []
     ref_times =[]
-    
+
     for label in labels:
         d_time, r_time = calculate_average_latencies(datasets[label])
         dec_times.append(d_time)
         ref_times.append(r_time)
-        
+
     x_pos = np.arange(len(labels))
     width = 0.5
-    
+
     # Bottom bar: Decision time
     ax2.bar(x_pos, dec_times, width, label='Decision Latency', color='tab:blue', edgecolor='black', alpha=0.8)
     # Top bar: Reflection time (Stacked)
     ax2.bar(x_pos, ref_times, width, bottom=dec_times, label='Reflection Latency', color='tab:orange', edgecolor='black', alpha=0.8)
-    
+
     # Add text labels on top of the bars
     for i in range(len(labels)):
         total_time = dec_times[i] + ref_times[i]
-        ax2.text(x_pos[i], total_time + 0.2, f"{total_time:.1f}s", ha='center', fontweight='bold')
-    
+        ax2.text(x_pos[i], total_time + 0.2, f"{total_time:.1f}s", ha='center', fontweight='bold', fontsize=14)
+
     ax2.set_xticks(x_pos)
-    ax2.set_xticklabels(labels, fontweight="bold")
-    ax2.set_ylabel("Average Inference Latency (Seconds)", fontweight="bold")
-    ax2.set_title("Average Inference Time per Adaptation", fontsize=13)
-    ax2.legend()
+    ax2.set_xticklabels(labels, fontweight="bold", fontsize=14)
+    ax2.set_ylabel("Average Inference Latency (Seconds)", fontweight="bold", fontsize=14)
+    ax2.set_title("Average Inference Time per Adaptation", fontweight="bold", fontsize=18, pad=15)
+    ax2.tick_params(axis="y", labelsize=15)
+    ax2.legend(fontsize=14)
     ax2.grid(True, axis="y", linestyle="--", alpha=0.6)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])

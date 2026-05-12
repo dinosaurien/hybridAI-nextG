@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Single Run Trace Plotter (High Resolution - 3 Panels)
+Single Run Trace Plotter (3 Panels)
 
 Usage:
   python plot_trace.py --csv energy5.csv
@@ -109,9 +109,10 @@ def plot_single_run(data: dict, out_dir: str, file_name: str = "single_run_trace
                 short_id = uid.replace("UE_", "")[-4:]
                 ax1.plot(l_mins, l_vals, color=ue_colors[i % len(ue_colors)], alpha=0.8, linewidth=1.2, label=f"UE ...{short_id}")
         
-        ax1.set_ylabel("Latency (ms)", fontweight="bold")
-        ax1.set_title("Per-UE Downlink Latency Spikes", fontsize=12)
-        ax1.legend(loc="upper left", ncol=len(ue_ids), fontsize=9)
+        ax1.set_ylabel("Latency (ms)", fontweight="bold", fontsize=18, labelpad=12)
+        ax1.set_title("Per-UE Downlink Latency Spikes", fontsize=22, pad=15)
+        ax1.legend(loc="upper left", ncol=len(ue_ids), fontsize=16)
+        ax1.tick_params(axis="both", labelsize=18, pad=8)
         ax1.grid(True, alpha=0.3)
     else:
         ax1.text(0.5, 0.5, "No UE Latency Data", ha='center', va='center')
@@ -130,10 +131,11 @@ def plot_single_run(data: dict, out_dir: str, file_name: str = "single_run_trace
                 short_id = uid.replace("UE_", "")[-4:]
                 ax2.plot(t_mins, t_vals, color=ue_colors[i % len(ue_colors)], alpha=0.7, linewidth=1.0, label=f"UE ...{short_id}")
         
-        ax2.set_ylabel("Throughput (kbps)", fontweight="bold")
-        ax2.set_xlabel("Time (Minutes)", fontweight="bold")
-        ax2.set_title("Per-UE Downlink Throughput", fontsize=12)
-        ax2.legend(loc="upper right", ncol=len(ue_ids), fontsize=9)
+        ax2.set_ylabel("Throughput (kbps)", fontweight="bold", fontsize=18, labelpad=12)
+        ax2.set_xlabel("Time (Minutes)", fontweight="bold", fontsize=18, labelpad=10)
+        ax2.set_title("Per-UE Downlink Throughput", fontsize=22, pad=15)
+        ax2.legend(loc="upper right", ncol=len(ue_ids), fontsize=16)
+        ax2.tick_params(axis="both", labelsize=18, pad=8)
         ax2.grid(True, alpha=0.3)
     else:
         ax2.text(0.5, 0.5, "No UE Throughput Data", ha='center', va='center')
@@ -150,14 +152,15 @@ def plot_single_run(data: dict, out_dir: str, file_name: str = "single_run_trace
         bar_colors =["tab:red", "tab:orange", "tab:green"]
         
         ax3.bar(labels_order, freqs, color=bar_colors, edgecolor="black", alpha=0.8, width=0.4)
-        ax3.set_ylabel("Frequency (Frames)", fontweight="bold")
-        ax3.set_xlabel("Modulation Type", fontweight="bold")
-        ax3.set_title("Total Distribution of Applied Modulation", fontsize=12)
+        ax3.set_ylabel("Frequency (Frames)", fontweight="bold", fontsize=18, labelpad=12)
+        ax3.set_xlabel("Modulation Type", fontweight="bold", fontsize=18, labelpad=10)
+        ax3.set_title("Total Distribution of Applied Modulation", fontsize=22, pad=15)
+        ax3.tick_params(axis="both", labelsize=18, pad=8)
         ax3.grid(True, alpha=0.3, axis="y")
     else:
         ax3.text(0.5, 0.5, "No MCS Bar Data Available", ha='center', va='center')
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.98]) # Leaves room for main title
+    plt.tight_layout(rect=[0, 0.03, 1, 0.98], h_pad=4.0)
     path = os.path.join(out_dir, file_name)
     plt.savefig(path, dpi=150)
     plt.close(fig)

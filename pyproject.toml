@@ -25,10 +25,6 @@ rdflib = "^7.6.0"
 torch = "^2.10.0"
 sentence-transformers = ">=3.0,<4.0"
 
-[tool.poetry.scripts]
-train_minirocket = "core.train_minirocket:main"
-train_minirocket_xapp = "core.train_minirocket_xapp:main"
-
 [tool.poetry.group.dev.dependencies]
 black = "^25.9.0"
 ipykernel = "^6.30.1"

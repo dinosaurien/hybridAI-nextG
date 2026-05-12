@@ -1,8 +1,5 @@
 """
-Append-only CSV logger for per-call LLM token usage.
-Used to compare token cost of LLM calls
-Captures llama.cpp's `response["usage"]` plus wall-clock latency for each
-LLM invocation, written next to the KPM CSV so experiments stay aligned.
+Append-only CSV logger for per-call LLM token usage and inference latency.
 """
 import csv
 import logging

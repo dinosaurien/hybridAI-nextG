@@ -16,8 +16,19 @@ import signal
 import threading
 import sys
 
-AI_ROOT = "/home/exposed/Desktop/hybridAI-nextG"
-SIM_ROOT = "/home/exposed/Desktop/simulator-bridge"
+# AI_ROOT is auto-detected from the script's own location (this file lives in
+# AI_ROOT/scripts/run_experiments.py, so AI_ROOT is two levels up).
+# SIM_ROOT defaults to a sibling directory next to AI_ROOT, which matches the
+# author's local layout; override with the SIM_ROOT environment variable if
+# your simulator-bridge checkout lives elsewhere.
+AI_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SIM_ROOT = os.environ.get("SIM_ROOT", os.path.join(os.path.dirname(AI_ROOT), "simulator-bridge"))
+
+if not os.path.isdir(SIM_ROOT):
+    sys.exit(
+        f"[run_experiments] simulator-bridge not found at {SIM_ROOT}.\n"
+        f"Set SIM_ROOT=/path/to/simulator-bridge or place it next to {AI_ROOT}."
+    )
 
 AI_SCRIPT = "./src/core/deploy.sh"
 SIM_SCRIPT = "./deploy.sh"
@@ -180,10 +191,10 @@ def main():
     os.makedirs(os.path.join(AI_ROOT, "logs"), exist_ok=True)
 
     print("="*70)
-    print("Automated Master's Thesis Experiments")
+    print("Automated Experiments for Evaluations chapter")
     print("="*70)
     
-    print("Please enter your sudo password. The script will keep the session alive automatically.")
+    print("Enter sudo password:")
     subprocess.run(["sudo", "-v"], check=True)
     threading.Thread(target=keep_sudo_alive, daemon=True).start()
     
@@ -196,14 +207,14 @@ def main():
     run_phase("Phase 2: AI (No Reflexion)", "--mode deploy --no-episodes", "no_reflexion", wipe_memory_first=True, runs=[1, 2, 3, 4, 5])
 
     # Phase 3: AI Managed WITH Reflexion
-    run_phase("Phase 3: AI (With Reflexion)", "--mode deploy", "reflexion", wipe_memory_first=True, runs=[1, 3, 4, 5])
+    run_phase("Phase 3: AI (With Reflexion)", "--mode deploy", "reflexion", wipe_memory_first=True, runs=[1, 2, 3, 4, 5])
 
     # Phase 4: Energy Efficiency Steering
     run_phase("Phase 4: Energy Intent", "--mode deploy", "energy", wipe_memory_first=True, energy_intent=True)
 
     print("\n" + "="*70)
     print("EXPERIMENTS COMPLETE! You now have 20 CSV files.")
-    print("Run `python evaluate_baseline.py --baseline ...` to generate graphs and metrics from each run")
+    print("Run `python scripts/evaluation.py --baseline ...` to generate graphs and metrics from each run")
     print("="*70)
 
 if __name__ == "__main__":

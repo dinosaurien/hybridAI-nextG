@@ -129,9 +129,7 @@ async def run_deploy(tcp_server, args):
     bus = MemBus()
     tcp_server.bus = bus
     kb = KnowledgeBase()
-
-    # Episode store for RAG — records anomaly→OTM→outcome cycles
-    # Disabled with --no-episodes for Reflexion ablation experiments
+    
     episode_store = None
     if not args.no_episodes:
         episode_store = EpisodeStore(store_path="models/episodes.jsonl")

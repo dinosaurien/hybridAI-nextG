@@ -1,5 +1,6 @@
 """
 Logging configuration with category-based filtering.
+This function is inherited and not really used anymore, hence the RL references.
 
 Log categories:
 1 = LEARNING - Model training, loss, Q-values, replay buffer

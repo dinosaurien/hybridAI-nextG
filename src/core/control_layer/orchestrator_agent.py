@@ -203,7 +203,6 @@ class OrchestratorAgent:
                             continue
                         else:
                             # Procedure is completely out of steps and anomaly still isn't resolved
-                            #
                             # We use the Reflexion logic, and rollback the procedural changes 
                             # to give the LLM a chance to correct its mistake and try a different approach
                             self.active_procedure.step_failures += 1
@@ -322,16 +321,12 @@ class OrchestratorAgent:
                         }, corr_id=msg.corr_id))
                     elif self.active_otm:
                         # Different metric or manual OTM active: merge anomaly into active OTM.
-                        # Snapshot the active OTM so we can restore it after the merged
-                        # anomaly resolves — preserves operator-driven intents (e.g. an
+                        # Snapshot the active OTM so we can restore it after the merged anomaly resolves — preserves operator-driven intents (e.g. an
                         # active "Energy Efficiency" intent) through the merge cycle.
                         self.pre_merge_otm = copy.deepcopy(self.active_otm)
-                        # Stamp the anomaly's cell_id into the snapshot's metadata. The
-                        # merged OTM produced downstream will be stamped with the same
-                        # cell_id by _apply_otm, so the Constraint Executor's per-cell
-                        # idempotency cache will use the same key for both. Without this,
-                        # the snapshot retains the (possibly None / default) cell_id
-                        # from before the anomaly, the cache lookup falls on a stale
+                        # Stamp the anomaly's cell_id into the snapshot's metadata. The  merged OTM produced downstream will be stamped with the same
+                        # cell_id by _apply_otm, so the Constraint Executor's per-cell idempotency cache will use the same key for both. Without this,
+                        # the snapshot retains the (possibly None / default) cell_id from before the anomaly, the cache lookup falls on a stale
                         # entry, and the restore-dispatch is silently skipped.
                         if anomaly_scope.get("cell_id"):
                             self.pre_merge_otm.setdefault("metadata", {})["cell_id"] = \
@@ -450,10 +445,8 @@ class OrchestratorAgent:
         self.triggering_anomaly = None
         self.last_metric_value = None
         self.adaptation_cycle_count = 0
-        # Pre-merge snapshot is consumed only by _release_anomaly_otm_if_needed on
-        # successful resolution. On any non-resolution path that funnels through
-        # _clear_anomaly_state (timeouts, LLM_FAILURE, adaptation-limit, scenario
-        # rollbacks), discard it so it cannot leak into a later anomaly cycle.
+        # Pre-merge snapshot is consumed only by _release_anomaly_otm_if_needed on successful resolution. On any non-resolution path that funnels through
+        # _clear_anomaly_state (timeouts, LLM_FAILURE, adaptation-limit, scenario rollbacks), discard it so it cannot leak into a later anomaly cycle.
         self.pre_merge_otm = None
 
     async def _route_manual_intent(self, text: str):
@@ -488,9 +481,8 @@ class OrchestratorAgent:
 
     def _apply_otm(self, otm: dict):
         """Common path: activate an OTM immediately (ASSURANCE window)."""
-        # Stamp the anomaly scope into OTM metadata so downstream actuators
-        # (NetworkOptimizer → ConstraintExecutor → xApp) know which cell/UE
-        # this intent targets, instead of falling back to CELL_001.
+        # Stamp the anomaly scope into OTM metadata so downstream actuators (NetworkOptimizer → ConstraintExecutor → xApp) 
+        # know which cell/UE this intent targets, instead of falling back to CELL_001.
         meta = otm.setdefault("metadata", {})
         if self.active_cell_id or self.active_ue_id:
             if self.active_cell_id and not meta.get("cell_id"):
@@ -498,9 +490,7 @@ class OrchestratorAgent:
             if self.active_ue_id and not meta.get("ue_id"):
                 meta["ue_id"] = self.active_ue_id
 
-        # Tag OTM source so the release path (WITHDRAWAL-resolved) can drop
-        # anomaly-driven OTMs back to baseline while keeping manual/scheduled
-        # intents in force.
+        # Tag OTM source so the release path (WITHDRAWAL-resolved) can drop anomaly-driven OTMs back to baseline while keeping manual/scheduled intents in force.
         if not meta.get("source"):
             meta["source"] = "anomaly" if self.triggering_anomaly else "operator"
 
@@ -591,12 +581,9 @@ class OrchestratorAgent:
     def _window_median(self, metric: str) -> Optional[float]:
         """Median of the anomaly metric over the withdrawal window.
 
-        Mirrors the data-collection pattern of _evaluate_health_check: for each
-        raw KPM sample within WITHDRAWAL_WINDOW seconds, try the cell metric
-        first, otherwise average across UEs for that timestamp. Median (not
-        mean) is used because mmWave KPIs are heavy-tailed and the single
-        instantaneous sample previously consulted here could flip the verdict
-        on a transient spike.
+        Mirrors the data-collection pattern of _evaluate_health_check: for each raw KPM sample within WITHDRAWAL_WINDOW seconds, 
+        try the cell metric first, otherwise average across UEs for that timestamp. Median (not mean) is used because mmWave KPIs are heavy-tailed 
+        and the single instantaneous sample previously consulted here could flip the verdict on a transient spike.
         """
         now = time.time()
         vals: List[float] = []
@@ -668,7 +655,7 @@ class OrchestratorAgent:
         trigger Reflexion self-reflection.
 
         Only called at cycle boundaries: final resolution, procedure completion,
-        or procedure rollback — NOT at every intermediate WITHDRAWAL step.
+        or procedure rollback and not at every intermediate WITHDRAWAL step.
         """
         if not self.episode_store or not self.triggering_anomaly:
             return
@@ -707,10 +694,9 @@ class OrchestratorAgent:
                 outcome=outcome,
             )
 
-            # Canonical Reflexion (Shinn et al. 2023 Algorithm 1): Msr is
-            # invoked ONLY when the evaluator Me reports failure. Successful
-            # trials are still recorded on disk above for audit, but we do
-            # not spend LLM tokens reflecting on outcomes that need no change.
+            # Canonical Reflexion (Shinn et al. 2023 Algorithm 1): LLM Self reflection called (denoted M_sr in the paper) is
+            # invoked only when the evaluator (M_e) reports failure. Successful trials are still recorded on disk above for audit, 
+            # but LLM tokens are not spent/wasted reflecting on outcomes that need no change.
             if resolved:
                 logger.info(f"[ORCHESTRATOR] Episode {episode_id[:8]} recorded "
                             f"(resolved=True, no reflection requested).")
@@ -718,8 +704,7 @@ class OrchestratorAgent:
 
             reflect_constraints = constraints_with_applied if constraints_with_applied else []
 
-            # Published on a separate topic so reflections don't block
-            # urgent OTM generation/adaptation on the ai.request queue.
+            # Published on a separate topic so reflections don't block urgent OTM generation/adaptation on the ai.request queue.
             await self.bus.pub("ai.reflect", make_msg(
                 "orchestrator", "REFLECT", "v1", {
                     "type": "reflect",
@@ -916,8 +901,6 @@ class OrchestratorAgent:
         for new_c in step.otm_fragment.get("constraints", []):
             cid = new_c.get("id")
             if cid in existing_ids:
-                # FIX: If the constraint already exists in the active_otm (meaning the LLM 
-                # put it there during adaptation), DO NOT overwrite it with the catalog defaults.
                 continue
             else:
                 tagged = dict(new_c)
@@ -1103,8 +1086,7 @@ class OrchestratorAgent:
             
         await self.bus.pub("procedure.update", make_msg("orch", "PROCEDURE", "v1", payload))
 
-    #  Graceful Cancel & Schedule Broadcast
-
+    # Graceful Cancel & Schedule Broadcast
     async def _apply_cancel_revert(self):
         """Apply deferred revert from a gracefully cancelled scheduled intent."""
         revert_otm = self.pending_cancel_revert
@@ -1139,8 +1121,7 @@ class OrchestratorAgent:
             })
         await self.bus.pub("schedule.update", make_msg("orch", "SCHEDULE", "v1", {"items": items}))
 
-    #  Temporal Scheduler
-
+    # Temporal Scheduler
     async def _enqueue_scheduled_intent(self, otm: dict, corr_id: str) -> ScheduledIntent:
         """Create a ScheduledIntent from an OTM with temporal metadata and add it to the queue."""
         temporal = otm.get("metadata", {}).get("temporal_resolved", {})
