@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<!--
+    Visual chrome and sidebar layout based on StartBootstrap SB Admin
+    (https://github.com/StartBootstrap/startbootstrap-sb-admin, MIT License,
+    Copyright (c) Start Bootstrap LLC). The upstream stylesheet is loaded
+    from its CDN at runtime; no copy is bundled in this repository. Custom
+    HTML, CSS and JavaScript in this dashboard are original work.
+-->
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <title>Telecom AI - Command Center</title>
+    <link href="https://startbootstrap.github.io/startbootstrap-sb-admin/css/styles.css" rel="stylesheet" />
+    <script src="https://use.fontawesome.com/releases/v6.3.0/js/all.js" crossorigin="anonymous"></script>
+    <style>
+        .scrollable { height: 300px; overflow-y: auto; background: #f8f9fa; border: 1px solid #dee2e6; }
+        .intent-card { border-left: 4px solid #4e73df; margin-bottom: 10px; padding: 10px; background: white; box-shadow: 0 .125rem .25rem rgba(0,0,0,.075); }
+        .ue-card { background: #e9ecef; border-radius: 5px; padding: 8px; margin-bottom: 5px; font-size: 0.85rem; }
+        .status-dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-right: 5px; }
+        .status-dot.connected { background-color: #2ecc71; box-shadow: 0 0 8px #2ecc71; }
+        .procedure-steps { padding-left: 20px; font-size: 0.9rem; }
+        .grafana-container { border: 1px solid #dee2e6; border-radius: 5px; background: #fff; overflow: hidden; height: 500px; }
+        iframe { width: 100%; height: 100%; border: none; }
+        
+        /* Procedure Timeline Styles */
+        .step-completed { color: #198754; }
+        .step-active { color: #0d6efd; font-weight: 600; }
+        .step-pending { color: #adb5bd; }
+        .step-failed { color: #dc3545; font-weight: 600; }
+
+        /* Intent bar — normal state */
+        .intent-bar-wrapper {
+            padding: 12px 0 8px 0;
+            z-index: 1020;
+        }
+        .intent-bar-placeholder {
+            display: none;
+        }
+        /* Intent bar — docked to navbar */
+        .intent-bar-wrapper.docked {
+            position: fixed;
+            top: 56px;
+            left: 0; right: 0;
+            padding: 10px 24px;
+            background: rgba(255,255,255,0.97);
+            backdrop-filter: blur(10px);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.12);
+            animation: slideDown 0.3s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+        }
+        /* Account for sidebar width when sidebar is open */
+        #layoutSidenav_content .intent-bar-wrapper.docked {
+            left: 225px;
+        }
+        .sb-sidenav-toggled #layoutSidenav_content .intent-bar-wrapper.docked {
+            left: 0;
+        }
+        @keyframes slideDown {
+            from { transform: translateY(-100%); opacity: 0; }
+            to   { transform: translateY(0); opacity: 1; }
+        }
+    </style>
+</head>
+<body class="sb-nav-fixed">
+    <nav class="sb-topnav navbar navbar-expand navbar-dark bg-dark">
+        <a class="navbar-brand ps-3" href="#">AI Dashboard</a>
+        <button class="btn btn-link btn-sm order-1 order-lg-0 me-4 me-lg-0" id="sidebarToggle"><i class="fas fa-bars"></i></button>
+
+        <!-- Live KPI inline -->
+        <div class="d-none d-md-flex align-items-center ms-3 gap-4 text-white" style="font-size:0.85rem;">
+            <span>gNB LATENCY: <strong id="gnbLatency">--</strong> ms</span>
+            <span>ACTIVE UEs: <strong id="ueCountBadge">0</strong></span>
+        </div>
+
+        <div class="d-flex align-items-center ms-auto me-3">
+            <span class="status-dot" id="statusDot"></span>
+            <small class="text-muted" id="statusText">Connecting...</small>
+        </div>
+    </nav>
+
+    <div id="layoutSidenav">
+        <div id="layoutSidenav_nav">
+            <nav class="sb-sidenav accordion sb-sidenav-dark" id="sidenavAccordion">
+                <div class="sb-sidenav-menu">
+                    <div class="nav">
+                        <div class="sb-sidenav-menu-heading">External Views</div>
+                        <a class="nav-link" href="http://localhost:3000/dashboards" target="_blank">
+                            <div class="sb-nav-link-icon"><i class="fas fa-chart-area text-warning"></i></div> Grafana Metrics
+                        </a>
+                        <div class="sb-sidenav-menu-heading">Sim Control</div>
+                        <button class="btn btn-outline-danger mx-3 mb-2 btn-sm" onclick="quickIntent('BREAK_SIM: LATENCY_SPIKE')">Traffic Spike</button>
+                        <button class="btn btn-outline-warning mx-3 btn-sm" onclick="quickIntent('BREAK_SIM: PACKET_LOSS')">Blockage</button>
+                    </div>
+                </div>
+            </nav>
+        </div>
+
+        <div id="layoutSidenav_content">
+            <main>
+                <div class="container-fluid px-4">
+                    <!-- Intent input bar (docks to navbar on scroll) -->
+                    <div class="intent-bar-placeholder" id="intentBarPlaceholder"></div>
+                    <div class="intent-bar-wrapper" id="intentBarWrapper">
+                        <div class="input-group shadow-sm" style="height: 52px; border-radius: 8px; overflow: hidden;">
+                            <span class="input-group-text bg-white border-end-0"><i class="fas fa-comment-dots text-primary"></i></span>
+                            <input class="form-control border-start-0 fs-6" type="text" id="userIntent"
+                                   placeholder="Type a manual intent... (e.g. Prepare the network for energy savings)"
+                                   style="height: 52px;" />
+                            <button class="btn btn-primary px-4" id="sendIntentBtn" type="button"><i class="fas fa-paper-plane me-1"></i> Send</button>
+                        </div>
+                    </div>
+
+                    <!-- Scheduled Intents | UE Metrics -->
+                    <div class="row mt-3 align-items-stretch">
+                        <div class="col-lg-5 col-md-6 d-flex mb-4">
+                            <div class="card shadow-sm flex-fill">
+                                <div class="card-header bg-secondary text-white"><i class="fas fa-clock me-1"></i> Scheduled Intents (<span id="scheduleCount">0</span>)</div>
+                                <div class="card-body scrollable" id="scheduleList" style="height: 250px;">
+                                    <div class="text-muted text-center py-3">No scheduled intents</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-lg-7 col-md-6 d-flex mb-4">
+                            <div class="card shadow-sm flex-fill">
+                                <div class="card-header bg-secondary text-white"><i class="fas fa-mobile-alt me-1"></i> UE Metrics</div>
+                                <div class="card-body scrollable" style="overflow-y: auto;" id="ueMetricsList">
+                                    <div class="empty-state text-muted text-center mt-5">No UE data</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Hidden cell ID holder (still needed by JS) -->
+                    <span id="cellId" class="d-none">--</span>
+
+                    <div class="row">
+                        <div class="col-12">
+                            <div class="card mb-4 shadow border-0">
+                                <div class="card-header bg-secondary text-white d-flex justify-content-between align-items-center">
+                                    <span><i class="fas fa-chart-line me-1"></i> Real-time Telemetry (Grafana Layer)</span>
+                                </div>
+                                <div class="card-body p-0 grafana-container">
+                                    <iframe src="http://localhost:3000/public-dashboards/151ff747227942249ca2bed40e4e6e44?refresh=1s"></iframe>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Reasoning | Procedures -->
+                    <div class="row">
+                        <div class="col-lg-6">
+                            <div class="card mb-4 shadow-sm border-primary">
+                                <div class="card-header bg-secondary text-white"><i class="fas fa-brain me-1"></i> Active Reasoning (<span id="intentCount">0</span>)</div>
+                                <div class="card-body scrollable" style="height: 500px;" id="intentsList">
+                                    <div class="empty-state text-muted text-center mt-5">No active intents</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-lg-6">
+                            <div class="card mb-4 shadow-sm border-info">
+                                <div class="card-header bg-secondary text-white"><i class="fas fa-tasks me-1"></i> Execution Procedure</div>
+                                <div class="card-body scrollable" style="height: 500px;" id="proceduresList">
+                                    <div class="empty-state text-muted text-center mt-5">No procedure active</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="card mb-4 shadow-sm">
+                                <div class="card-header bg-warning text-dark font-weight-bold"><i class="fas fa-exclamation-triangle me-1"></i> MiniRocket Deviations (<span id="deviationCount">0</span>)</div>
+                                <div class="card-body scrollable" id="deviationsList"></div>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="card mb-4 shadow-sm">
+                                <div class="card-header bg-secondary text-white font-weight-bold"><i class="fas fa-terminal me-1"></i> Actuator Logs (<span id="commandCount">0</span>)</div>
+                                <div class="card-body scrollable" id="commandsList"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // --- API HELPERS ---
+        async function sendIntent() {
+            const input = document.getElementById('userIntent');
+            const text = input.value.trim();
+            if (!text) return;
+            
+            const btn = document.getElementById('sendIntentBtn');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+            btn.disabled = true;
+
+            try {
+                const res = await fetch('/api/intent', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ text: text })
+                });
+                const data = await res.json();
+                if (data.status === "ok") input.value = "";
+            } catch (e) { 
+                console.error("Error sending intent", e); 
+            } finally {
+                btn.innerHTML = originalText;
+                btn.disabled = false;
+            }
+        }
+
+        async function quickIntent(text) {
+            try {
+                await fetch('/api/intent', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ text: text })
+                });
+                console.log("Intent Sent:", text);
+            } catch (e) { console.error("Error sending intent", e); }
+        }
+
+        async function cancelSchedule(scheduleId) {
+            try {
+                const res = await fetch('/api/schedule/cancel', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ schedule_id: scheduleId })
+                });
+                const data = await res.json();
+                if (data.status !== "ok") console.error("Cancel failed:", data);
+            } catch (e) { console.error("Error cancelling schedule", e); }
+        }
+
+        // --- DASHBOARD CLIENT ---
+        class DashboardClient {
+            constructor() {
+                this.ws = null;
+                this.reconnectInterval = 3000;
+                this.maxReconnectAttempts = 10;
+                this.reconnectAttempts = 0;
+
+                // Data State
+                this.intents = new Map();
+                this.deviations = [];
+                this.commands = [];
+                this.activeProcedure = null;
+                this.scheduleQueue = [];
+                this.maxHistoryItems = 50;
+                
+                this.ueStats = {};       
+                this.displayCache = {};  
+
+                // DOM Mappings
+                this.statusDot = document.getElementById('statusDot');
+                this.statusText = document.getElementById('statusText');
+                this.intentsList = document.getElementById('intentsList');
+                this.deviationsList = document.getElementById('deviationsList');
+                this.commandsList = document.getElementById('commandsList');
+                this.intentCount = document.getElementById('intentCount');
+                this.deviationCount = document.getElementById('deviationCount');
+                this.commandCount = document.getElementById('commandCount');
+                this.gnbLatency = document.getElementById('gnbLatency');
+                this.cellId = document.getElementById('cellId');
+                this.ueCountBadge = document.getElementById('ueCountBadge');
+                this.ueMetricsList = document.getElementById('ueMetricsList');
+                this.scheduleList = document.getElementById('scheduleList');
+                this.scheduleCount = document.getElementById('scheduleCount');
+                this.proceduresList = document.getElementById('proceduresList');
+
+                this.connect();
+            }
+
+            connect() {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}/ws`;
+                this.ws = new WebSocket(wsUrl);
+
+                this.ws.onopen = () => {
+                    this.statusDot.classList.add('connected');
+                    this.statusText.textContent = 'Connected';
+                };
+                this.ws.onclose = () => {
+                    this.statusDot.classList.remove('connected');
+                    this.statusText.textContent = 'Disconnected';
+                    setTimeout(() => this.connect(), 3000);
+                };
+                this.ws.onmessage = (event) => this.onMessage(event);
+            }
+
+            onMessage(event) {
+                try {
+                    const message = JSON.parse(event.data);
+                    switch (message.type) {
+                        case 'intent': this.handleIntent(message.data); break;
+                        case 'deviation': this.handleDeviation(message.data); break;
+                        case 'command': this.handleCommand(message.data); break;
+                        case 'kpi': this.handleKPI(message.data); break;
+                        case 'cc_notification': this.handleCC(message.data); break;
+                        case 'procedure': this.handleProcedure(message.data); break;
+                        case 'schedule': this.handleSchedule(message.data); break;
+                    }
+                } catch (e) {
+                    console.error('Error parsing message:', e);
+                }
+            }
+
+            handleKPI(data) {
+                const { cell, ues } = data;
+                if (cell && cell.DRB_PdcpSduDelayDl !== undefined) {
+                    this.gnbLatency.textContent = cell.DRB_PdcpSduDelayDl.toFixed(2);
+                }
+                if (cell && cell.cell_id) {
+                    this.cellId.textContent = cell.cell_id;
+                }
+                if (ues && ues.length > 0) {
+                    this.ueCountBadge.textContent = ues.length;
+                    this.renderUEMetrics(ues);
+                } else {
+                    this.ueCountBadge.textContent = '0';
+                    this.ueMetricsList.innerHTML = '<div class="empty-state text-muted text-center mt-5">No UE data</div>';
+                }
+            }
+
+            renderUEMetrics(ues) {
+                const html = ues.map(ue => {
+                    const ueId = ue.ue_id || 'Unknown';
+                    const latency = ue.UE_DRB_PdcpSduDelayDl_UEID;
+                    const currentRawThp = ue.UE_DRB_UEThpDl_UEID;
+
+                    if (!this.displayCache[ueId]) {
+                        this.displayCache[ueId] = { latency: '--', throughput: '0.00' };
+                    }
+
+                    if (latency !== undefined && latency > 0) {
+                        this.displayCache[ueId].latency = latency.toFixed(2);
+                    }
+
+                    if (currentRawThp !== undefined) {
+                        // Bus value is instantaneous throughput in kbps. Show it as Mbps.
+                        this.displayCache[ueId].throughput = (currentRawThp / 1000).toFixed(2);
+                    }
+
+                    return `
+                        <div class="ue-card">
+                            <strong>📱 UE: ${this.escapeHtml(ueId)}</strong><br>
+                            Lat: ${this.displayCache[ueId].latency} ms<br> 
+                            Thp: ${this.displayCache[ueId].throughput} Mbps
+                        </div>
+                    `;
+                }).join('');
+
+                this.ueMetricsList.innerHTML = html;
+            }
+
+            handleIntent(data) {
+                if (!data || Object.keys(data).length === 0) {
+                    this.intents.clear();
+                } else {
+                    // Only one OTM is active at a time — clear stale entries
+                    this.intents.clear();
+                    this.intents.set(data.intent_id || 'unknown', data);
+                }
+                this.renderIntents();
+            }
+
+            renderIntents() {
+                this.intentCount.textContent = this.intents.size;
+                this.intentsList.innerHTML = Array.from(this.intents.values()).map((intent, idx) => {
+                    
+                    // The optimizer populates "procedure_steps" with the mathematical constraints
+                    const mathConstraints = (intent.procedure_steps || []).map(step =>
+                        `<li><small><i class="fas fa-check text-success"></i> ${this.escapeHtml(step)}</small></li>`
+                    ).join('');
+                    
+                    const rawOtm = intent.raw_otm || '';
+                    
+                    return `
+                    <div class="intent-card">
+                        <h6><strong>Intent:</strong> ${this.escapeHtml(intent.type || intent.intent_name || 'Optimizing')}</h6>
+                        
+                        <div class="mt-2 mb-1 fw-bold text-muted" style="font-size: 0.8rem;">Applied Constraints:</div>
+                        <ul class="list-unstyled ms-2 mb-2">${mathConstraints}</ul>
+                        
+                        ${rawOtm ? `
+                        <details class="otm-details">
+                            <summary class="text-muted small">View JSON Payload</summary>
+                            <pre class="otm-json" style="font-size:0.75rem;">${this.escapeHtml(rawOtm)}</pre>
+                        </details>` : ''}
+                    </div>`;
+                }).join('') || '<div class="text-center mt-5 text-muted">No active intents</div>';
+            }
+
+            // NEW: Procedure Handling and UI Timeline Rendering
+            handleProcedure(data) {
+                // Keep the active procedure visible even if completed/failed, until a new one overrides it
+                this.activeProcedure = data;
+                this.renderProcedures();
+            }
+
+            renderProcedures() {
+                if (!this.activeProcedure) {
+                    this.proceduresList.innerHTML = '<div class="empty-state text-muted text-center mt-5">No procedure active</div>';
+                    return;
+                }
+
+                const proc = this.activeProcedure;
+                let html = `<h6 class="text-dark fw-bold mb-3">${this.escapeHtml(proc.scenario_name)}</h6>`;
+
+                if (proc.all_steps && Array.isArray(proc.all_steps)) {
+                    proc.all_steps.forEach(step => {
+                        let iconClass = 'fa-circle step-pending';
+                        let textClass = 'step-pending';
+                        let note = '';
+
+                        // Determine step status
+                        if (proc.state === 'COMPLETED' || step.order < proc.current_step) {
+                            iconClass = 'fa-check-circle step-completed';
+                            textClass = 'text-dark';
+                        } else if (proc.state === 'FAILED' && step.order === proc.current_step) {
+                            iconClass = 'fa-times-circle step-failed';
+                            textClass = 'step-failed';
+                            note = '<br><small>Rollback Triggered</small>';
+                        } else if (step.order === proc.current_step) {
+                            iconClass = 'fa-spinner fa-spin step-active';
+                            textClass = 'step-active';
+                            note = '<br><small>Assurance Window Active (30s)...</small>';
+                        }
+
+                        html += `
+                            <div class="d-flex mb-3 align-items-start">
+                                <div class="me-3 mt-1"><i class="fas ${iconClass} fs-5"></i></div>
+                                <div>
+                                    <div class="${textClass}" style="font-size: 0.95rem;">Step ${step.order}: ${this.escapeHtml(step.name)}</div>
+                                    <div class="text-muted" style="font-size: 0.8rem; line-height: 1.2;">
+                                        ${this.escapeHtml(step.description)}${note}
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    });
+                } else {
+                    html += '<div class="text-muted">Procedure steps unavailable.</div>';
+                }
+
+                this.proceduresList.innerHTML = html;
+            }
+
+            handleSchedule(data) {
+                if (data && data.items) {
+                    this.scheduleQueue = data.items;
+                }
+                this.renderSchedule();
+            }
+
+            renderSchedule() {
+                const liveItems = this.scheduleQueue.filter(s => s.state === 'PENDING' || s.state === 'ACTIVE');
+                const historyItems = this.scheduleQueue.filter(s => s.state === 'CANCELLED' || s.state === 'EXPIRED');
+                this.scheduleCount.textContent = liveItems.length;
+
+                if (this.scheduleQueue.length === 0) {
+                    this.scheduleList.innerHTML = '<div class="text-muted text-center py-3">No scheduled intents</div>';
+                    return;
+                }
+
+                const renderItem = (s) => {
+                    const stateColors = { 'PENDING': 'warning', 'ACTIVE': 'success', 'CANCELLED': 'secondary', 'EXPIRED': 'dark' };
+                    const stateIcons = { 'PENDING': 'fa-clock', 'ACTIVE': 'fa-play-circle', 'CANCELLED': 'fa-ban', 'EXPIRED': 'fa-check-circle' };
+                    const color = stateColors[s.state] || 'secondary';
+                    const icon = stateIcons[s.state] || 'fa-circle';
+                    const canCancel = s.state === 'PENDING' || s.state === 'ACTIVE';
+                    const cancelLabel = s.state === 'ACTIVE' ? 'Cancel (graceful)' : 'Cancel';
+                    const cancelBtn = canCancel
+                        ? `<button class="btn btn-outline-danger btn-sm" onclick="cancelSchedule('${s.id}')">${cancelLabel}</button>`
+                        : '';
+                    const pendingNote = s.cancel_pending
+                        ? '<small class="text-warning d-block"><i class="fas fa-hourglass-half"></i> Reverting after current work completes...</small>'
+                        : '';
+                    const activateTime = new Date(s.activate_at).toLocaleString();
+                    const deactivateTime = s.deactivate_at ? new Date(s.deactivate_at).toLocaleString() : 'No expiry';
+
+                    return `
+                        <div class="d-flex justify-content-between align-items-center border-bottom py-2 px-1">
+                            <div>
+                                <i class="fas ${icon} text-${color} me-2 fs-5"></i>
+                                <strong>${this.escapeHtml(s.raw_text)}</strong>
+                                <span class="badge bg-${color} ms-2">${s.state}</span>
+                                ${pendingNote}
+                                <small class="text-muted d-block mt-1">Activate: ${activateTime} | Expires: ${deactivateTime}</small>
+                            </div>
+                            <div>${cancelBtn}</div>
+                        </div>`;
+                };
+
+                let html = liveItems.map(renderItem).join('');
+                if (historyItems.length > 0) {
+                    html += '<hr class="my-2"><small class="text-muted fw-bold">Recent History:</small>';
+                    html += historyItems.slice(-5).map(renderItem).join('');
+                }
+                this.scheduleList.innerHTML = html;
+            }
+
+            handleDeviation(data) {
+                this.deviations.unshift(data);
+                if (this.deviations.length > this.maxHistoryItems) this.deviations.pop();
+                this.deviationCount.textContent = this.deviations.length;
+                
+                this.deviationsList.innerHTML = this.deviations.map(d => {
+                    let valStr = 'N/A';
+                    if (d.value !== undefined && d.value !== null) {
+                        const num = Number(d.value);
+                        valStr = !isNaN(num) ? num.toFixed(2) : this.escapeHtml(String(d.value));
+                    }
+                    return `<div class="p-1 border-bottom small">⚠️ ${this.escapeHtml(d.metric)}: <strong class="text-danger">${valStr}</strong></div>`;
+                }).join('');
+            }
+
+            handleCommand(data) {
+                this.commands.unshift(data);
+                if (this.commands.length > this.maxHistoryItems) this.commands.pop();
+                this.commandCount.textContent = this.commands.length;
+                this.commandsList.innerHTML = this.commands.map(c => `
+                    <div class="p-1 border-bottom small font-monospace">📡 ${this.escapeHtml(c.command)} <span class="text-muted">(${this.escapeHtml(JSON.stringify(c.params))})</span></div>
+                `).join('');
+            }
+
+            handleCC(data) {
+                const list = document.getElementById('commandsList');
+                const item = `<div class="p-1 border-bottom small text-primary">🧠 <strong>Reasoner Callback:</strong> ${this.escapeHtml(data.message)}</div>`;
+                list.innerHTML = item + list.innerHTML;
+            }
+
+            escapeHtml(text) {
+                if (!text) return '';
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            new DashboardClient();
+            document.getElementById('sendIntentBtn').onclick = sendIntent;
+            document.getElementById('userIntent').onkeypress = (e) => { if(e.key==='Enter') sendIntent(); };
+            
+            document.getElementById('sidebarToggle').onclick = e => {
+                e.preventDefault();
+                document.body.classList.toggle('sb-sidenav-toggled');
+            };
+
+            // Intent bar: dock to navbar when 50% scrolled away, return on scroll back
+            const intentBar = document.getElementById('intentBarWrapper');
+            const placeholder = document.getElementById('intentBarPlaceholder');
+            let isDocked = false;
+            let barOriginalTop = 0;
+
+            function measureBarPosition() {
+                if (!isDocked) barOriginalTop = intentBar.getBoundingClientRect().top + window.scrollY;
+            }
+            measureBarPosition();
+
+            window.addEventListener('scroll', () => {
+                const navbarH = 56;
+                const barH = intentBar.offsetHeight;
+                const triggerPoint = barOriginalTop - navbarH + (barH * 0.5);
+
+                if (!isDocked && window.scrollY > triggerPoint) {
+                    // Dock it
+                    isDocked = true;
+                    placeholder.style.display = 'block';
+                    placeholder.style.height = barH + 'px';
+                    intentBar.classList.remove('undocking');
+                    intentBar.classList.add('docked');
+                } else if (isDocked && window.scrollY <= triggerPoint) {
+                    // Undock: return to flow instantly — the bar is already
+                    // scrolling back into its original spot so no animation needed
+                    isDocked = false;
+                    intentBar.classList.remove('docked');
+                    placeholder.style.display = 'none';
+                    measureBarPosition();
+                }
+            }, { passive: true });
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,412 @@
+/* --- Global & Theme Variables --- */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+:root {
+    --bg-primary: #0a0e1a;
+    --bg-secondary: #131824;
+    --bg-panel: rgba(25, 32, 48, 0.8);
+    --border-color: rgba(99, 102, 241, 0.2);
+    --accent-primary: #6366f1;
+    --accent-secondary: #8b5cf6;
+    --text-primary: #e2e8f0;
+    --text-secondary: #94a3b8;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --error: #ef4444;
+    --shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
+    color: var(--text-primary);
+    min-height: 100vh;
+}
+
+.container {
+    max-width: 1600px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+/* --- Components --- */
+
+.header {
+    background: var(--bg-panel);
+    backdrop-filter: blur(10px);
+    border: 1px solid var(--border-color);
+    border-radius: 16px;
+    padding: 24px 32px;
+    margin-bottom: 24px;
+    box-shadow: var(--shadow);
+}
+
+.header h1 {
+    font-size: 28px;
+    background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.connection-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    color: var(--text-secondary);
+}
+
+.step-rationale {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    margin-top: 4px;
+    font-weight: 400;
+}
+
+.status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--error);
+}
+
+.status-dot.connected {
+    background: var(--success);
+    box-shadow: 0 0 10px var(--success);
+}
+
+/* --- Layout Grid --- */
+.dashboard-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 24px;
+}
+
+.panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--border-color);
+    border-radius: 16px;
+    padding: 24px;
+    box-shadow: var(--shadow);
+}
+
+.panel-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 20px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.badge {
+    background: var(--accent-primary);
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.scrollable {
+    max-height: 450px;
+    overflow-y: auto;
+    padding-right: 8px;
+}
+
+/* --- Intent Cards (Hierarchical Logic) --- */
+.intent-card {
+    background: rgba(99, 102, 241, 0.05);
+    border: 1px solid var(--accent-primary);
+    border-left: 4px solid var(--accent-primary);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 16px;
+    animation: slideIn 0.3s ease-out;
+}
+
+.procedure-badge {
+    display: inline-block;
+    background: rgba(139, 92, 246, 0.2);
+    border: 1px solid var(--accent-secondary, #8b5cf6);
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 0.7rem;
+    color: var(--accent-secondary, #8b5cf6);
+    margin-left: 8px;
+    vertical-align: middle;
+}
+
+.procedure-status {
+    font-size: 0.8rem;
+    color: #a5f3fc;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 6px;
+    padding: 4px 10px;
+    margin-bottom: 8px;
+}
+
+.otm-details {
+    margin-top: 10px;
+}
+
+.otm-details summary {
+    cursor: pointer;
+    font-size: 0.8rem;
+    color: var(--accent-secondary, #8b5cf6);
+    font-weight: 600;
+    user-select: none;
+}
+
+.otm-json {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border-color, #334155);
+    border-radius: 8px;
+    padding: 12px;
+    margin-top: 8px;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: #a5f3fc;
+    overflow-x: auto;
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.intent-type {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 15px;
+}
+
+.intent-label-small {
+    font-size: 0.65rem;
+    font-weight: 800;
+    color: var(--text-secondary);
+    margin-top: 14px;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.intent-reasoning-container {
+    font-size: 0.85rem;
+    color: #cbd5e1;
+    line-height: 1.5;
+}
+
+.intent-reasoning-container ul {
+    padding-left: 18px;
+}
+
+.intent-reasoning-container li {
+    margin-bottom: 4px;
+}
+
+.decomp-list {
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 6px;
+    padding: 10px;
+}
+
+.decomp-row {
+    font-size: 0.8rem;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    color: var(--text-primary);
+}
+
+.decomp-row:last-child { border-bottom: none; }
+
+.decomp-row b {
+    color: var(--success);
+    font-family: monospace;
+}
+
+.intent-scope {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    margin-top: 12px;
+    font-family: monospace;
+    text-align: right;
+}
+
+/* --- Minirocket & Actuator Items --- */
+.deviation-item, .command-item {
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 10px;
+    font-size: 13px;
+}
+
+.deviation-item {
+    background: rgba(239, 68, 68, 0.1);
+    border-left: 3px solid var(--error);
+}
+
+.command-item {
+    background: rgba(16, 185, 129, 0.1);
+    border-left: 3px solid var(--success);
+}
+
+.deviation-metric { font-weight: 600; color: var(--error); }
+.command-name { font-weight: 600; color: var(--success); }
+
+.command-params {
+    font-family: monospace;
+    font-size: 11px;
+    display: block;
+    margin-top: 5px;
+    word-break: break-all;
+    color: var(--text-secondary);
+}
+
+/* --- KPI Metrics Section --- */
+.gnb-metric-card {
+    background: rgba(99, 102, 241, 0.1);
+    border: 1px solid var(--accent-primary);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+}
+
+.metric-header {
+    font-size: 12px;
+    font-weight: 800;
+    color: var(--accent-primary);
+    margin-bottom: 12px;
+    text-transform: uppercase;
+}
+
+.metric-value {
+    font-size: 24px;
+    font-weight: 800;
+    color: var(--text-primary);
+}
+
+.ue-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 10px;
+}
+
+.trigger-code {
+    background: #000 !important;
+    color: #00ff9d !important; /* Matrix/Next-G Green */
+    padding: 12px;
+    border-radius: 6px;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 0.75rem;
+    margin: 8px 0;
+    border: 1px solid #222;
+    line-height: 1.5;
+}
+
+/* Styling the new Triggering Intents box */
+.trigger-code {
+    background: #000 !important;
+    color: #00ff9d !important; /* Matrix/Next-G Green */
+    padding: 10px;
+    border-radius: 6px;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 0.75rem;
+    margin: 8px 0;
+    border: 1px solid #222;
+    line-height: 1.4;
+    overflow-x: auto;
+}
+
+/* Styling the Numbered Procedure */
+.procedure-steps {
+    margin: 10px 0;
+    padding-left: 22px;
+    font-size: 0.85rem;
+    color: #e2e8f0;
+}
+
+.procedure-steps li {
+    margin-bottom: 6px;
+    line-height: 1.4;
+}
+
+/* New Section Labels */
+.intent-label-small {
+    font-size: 0.6rem;
+    font-weight: 800;
+    color: #6366f1; /* Accent Color */
+    margin-top: 15px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.no-data {
+    font-style: italic;
+    color: #555;
+    font-size: 0.8rem;
+    padding: 5px 0;
+}
+
+.procedure-steps {
+    margin: 10px 0;
+    padding-left: 20px;
+    font-size: 0.85rem;
+    color: #e2e8f0;
+}
+
+.procedure-steps li {
+    margin-bottom: 8px;
+    line-height: 1.4;
+}
+
+.intent-label-small {
+    font-size: 0.65rem;
+    font-weight: 800;
+    color: var(--accent-secondary);
+    margin-top: 15px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.no-data {
+    font-style: italic;
+    color: #555;
+    font-size: 0.8rem;
+    padding: 5px 0;
+}
+
+.intent-card.hierarchical {
+    border-left: 4px solid var(--accent-secondary);
+    background: rgba(139, 92, 246, 0.05); /* Slight purple tint */
+}
+
+.ue-id {
+    color: var(--accent-secondary);
+    font-weight: 700;
+    margin-bottom: 8px;
+    font-size: 12px;
+}
+
+.ue-metric-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    margin-bottom: 4px;
+}
+
+/* --- Animations --- */
+@keyframes slideIn {
+    from { opacity: 0; transform: translateX(-10px); }
+    to { opacity: 1; transform: translateX(0); }
+}
+
+/* --- Custom Scrollbar --- */
+.scrollable::-webkit-scrollbar { width: 4px; }
+.scrollable::-webkit-scrollbar-track { background: transparent; }
+.scrollable::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 10px; }
